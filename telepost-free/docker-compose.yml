@@ -1,0 +1,38 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Разово скачивает модель из LLM_MODEL (например qwen3:4b) и завершается
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    env_file: .env
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$${LLM_MODEL:-qwen3:4b}\""]
+    restart: "no"
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    env_file: .env
+    environment:
+      LLM_URL: http://ollama:11434
+      DB_PATH: /app/data/bot.sqlite3
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  ollama:
