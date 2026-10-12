@@ -27,6 +27,7 @@ class Config:
     db_path: str = "data/bot.sqlite3"
     llm_url: str = "http://localhost:11434"
     llm_model: str = "qwen3:4b"
+    llm_api_key: str = ""  # задан — OpenAI-совместимый API (Groq), иначе Ollama
     llm_timeout: int = 180
     default_tz: str = "Europe/Moscow"
     pro_price_stars: int = 150
@@ -36,6 +37,7 @@ class Config:
     tg_api_id: int = 0
     tg_api_hash: str = ""
     tg_session: str = "data/userbot"
+    tg_session_string: str = ""  # сессия аккаунта одной строкой (для хостинга без постоянных файлов)
     feed_poll_seconds: int = 120
     # Как публиковать посты с премиум-эмодзи: auto — через аккаунт-читатель (если он Premium и админ
     # канала), иначе ботом; bot — всегда ботом.
@@ -70,7 +72,7 @@ class Config:
 DEFAULT_MENU_EMOJI: dict[str, str] = {
     "post": "5258073068852485953",      # Создать пост
     "queue": "5257965174979042426",     # План постов
-    "channels": "5260268501515377807",  # Каналы
+    "channels": "5257963315258204021",  # Каналы
     "feeds": "5258093637450866522",     # Нейропостинг
     "settings": "5258096772776991776",  # Настройки
     "pro": "5258165702707125574",       # Тариф Pro
@@ -105,6 +107,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         db_path=env.get("DB_PATH", "data/bot.sqlite3"),
         llm_url=env.get("LLM_URL", "http://localhost:11434"),
         llm_model=env.get("LLM_MODEL", "qwen3:4b"),
+        llm_api_key=env.get("LLM_API_KEY", "").strip(),
         llm_timeout=int(env.get("LLM_TIMEOUT", "180")),
         default_tz=env.get("DEFAULT_TZ", "Europe/Moscow"),
         pro_price_stars=int(env.get("PRO_PRICE_STARS", "150")),
@@ -113,6 +116,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         tg_api_id=int(env.get("TG_API_ID", "0") or 0),
         tg_api_hash=env.get("TG_API_HASH", "").strip(),
         tg_session=env.get("TG_SESSION", "data/userbot"),
+        tg_session_string=env.get("TG_SESSION_STRING", "").strip(),
         feed_poll_seconds=int(env.get("FEED_POLL_SECONDS", "120")),
         feed_publish_via=env.get("FEED_PUBLISH_VIA", "auto").strip().lower() or "auto",
         feed_staging_chat=int(env.get("FEED_STAGING_CHAT", "0").strip() or 0),

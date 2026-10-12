@@ -1,6 +1,6 @@
-"""Нейро-рерайт через локальную открытую модель (Qwen3 в Ollama). Платных API нет.
+"""Нейро-рерайт: локальная Ollama (Qwen3) или любой OpenAI-совместимый API (Groq и др.), если задан LLM_API_KEY.
 
-Только стандартная библиотека: запрос к Ollama идёт через urllib в отдельном потоке.
+Только стандартная библиотека: запрос идёт через urllib в отдельном потоке.
 """
 from __future__ import annotations
 
@@ -77,13 +77,12 @@ def restore_links(original: str, rewritten: str) -> str:
     return rewritten
 
 
-def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+def _post_json(url: str, payload: dict[str, Any], timeout: int, api_key: str = "") -> dict[str, Any]:
+    # User-Agent обязателен: Cloudflare перед API (Groq и др.) отклоняет стандартный «Python-urllib»
+    headers = {"Content-Type": "application/json", "User-Agent": "pilotpost-bot/1.0", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -97,11 +96,13 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
 
 
 async def rewrite(
-    text: str, *, url: str, model: str, timeout: int = 180, style: str = "normal"
+    text: str, *, url: str, model: str, timeout: int = 180, style: str = "normal", api_key: str = ""
 ) -> str:
     if not text or not text.strip():
         raise LLMError("Нечего переписывать: текст пустой")
     hint = STYLES.get(style, STYLES["normal"])
+    if api_key:
+        return await _rewrite_openai(text, hint, url, model, timeout, api_key)
     payload = {
         "model": model,
         "stream": False,
@@ -118,6 +119,30 @@ async def rewrite(
         raise LLMError("Модель не уложилась в лимит длины ответа (возможно, «рассуждает»): пост останется без рерайта")
     content = (data.get("message") or {}).get("content", "")
     out = clean_output(content)
+    if not out:
+        raise LLMError("Модель вернула пустой ответ")
+    return restore_links(text, out)[:MAX_MESSAGE]
+
+
+async def _rewrite_openai(text: str, hint: str, url: str, model: str, timeout: int, api_key: str) -> str:
+    """OpenAI-совместимый API (Groq: LLM_URL=https://api.groq.com/openai/v1)."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": 0.7,
+        # у «думающих» моделей рассуждения тоже считаются в лимит: даём запас сверх длины самого поста
+        "max_tokens": gen_limit(text) + 1500,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"{hint}\n\n<post>\n{text}\n</post>"},
+        ],
+    }
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "low"  # короткие рассуждения: быстрее и экономнее по лимитам
+    data = await asyncio.to_thread(_post_json, f"{url.rstrip('/')}/chat/completions", payload, timeout, api_key)
+    choice = (data.get("choices") or [{}])[0]
+    if choice.get("finish_reason") == "length":
+        raise LLMError("Модель не уложилась в лимит длины ответа: пост останется без рерайта")
+    out = clean_output((choice.get("message") or {}).get("content", ""))
     if not out:
         raise LLMError("Модель вернула пустой ответ")
     return restore_links(text, out)[:MAX_MESSAGE]

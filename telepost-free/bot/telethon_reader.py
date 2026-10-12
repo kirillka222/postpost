@@ -41,9 +41,13 @@ class TelethonReader:
         self._cache: dict[str, Any] = {}  # ключ источника → сущность канала (не дёргаем API каждый опрос)
 
     @classmethod
-    def create(cls, api_id: int, api_hash: str, session: str) -> "TelethonReader":
+    def create(cls, api_id: int, api_hash: str, session: str, session_string: str = "") -> "TelethonReader":
         from telethon import TelegramClient  # импорт здесь: без Telethon остальной бот работает
 
+        if session_string:  # сессия из переменной окружения: файлы на диске не нужны
+            from telethon.sessions import StringSession
+
+            return cls(TelegramClient(StringSession(session_string), api_id, api_hash))
         return cls(TelegramClient(session, api_id, api_hash))
 
     async def start(self) -> bool:
@@ -164,9 +168,17 @@ class TelethonReader:
     async def _download(self, m: Any, kind: str) -> Optional[MediaItem]:
         f = getattr(m, "file", None)
         if f is not None and (getattr(f, "size", 0) or 0) > MAX_MEDIA_BYTES:
-            log.info("Сообщение %s: файл %d МБ больше лимита %d МБ, пропущен", m.id,
+            # Бот такой файл не загрузит. Не качаем: аккаунт отправит его по ссылке через служебный канал
+            log.info("Сообщение %s: файл %d МБ больше лимита %d МБ, уйдёт через служебный канал", m.id,
                      (f.size or 0) // 2**20, MAX_MEDIA_BYTES // 2**20)
-            return None
+            name = getattr(f, "name", None) or (
+                f"{kind}{f.ext}" if getattr(f, "ext", None) else _DEFAULT_NAME[kind])
+            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None), big=True)
+            if kind == "video":
+                item.duration = int(getattr(f, "duration", 0) or 0)
+                item.width = int(getattr(f, "width", 0) or 0)
+                item.height = int(getattr(f, "height", 0) or 0)
+            return item
         try:
             data = await self.client.download_media(m, file=bytes)
         except Exception as exc:  # noqa: BLE001

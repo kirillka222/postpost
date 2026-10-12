@@ -29,8 +29,11 @@ async def deliver(
     """Публикует пост в канал. Посты с премиум-эмодзи по возможности шлёт аккаунт-читатель (Premium,
     админ канала): бот не может надёжно ставить премиум-эмодзи в каналы. Иначе публикует бот."""
     via = (cfg.feed_publish_via if cfg is not None else "auto")
-    if via == "auto" and has_custom_emoji(entities) and getattr(reader, "premium", False) \
-            and hasattr(reader, "send"):
+    big = any(getattr(m, "big", False) for m in post.media)  # файлы больше 20 МБ боту не по силам
+    emoji = has_custom_emoji(entities)
+    if hasattr(reader, "send") and (
+        big or (via == "auto" and emoji and getattr(reader, "premium", False))
+    ):
         staging = cfg.feed_staging_chat if cfg is not None else 0
         if staging and stage is not None and not stage.get("failed"):
             # Витрина: аккаунт один раз публикует пост в служебный канал, бот копирует его пользователю.
@@ -54,14 +57,19 @@ async def deliver(
             return
         except Exception as exc:  # noqa: BLE001
             log.warning("Публикация от имени аккаунта в %s не удалась (%s), публикую ботом", target, exc)
-            if _should_notify("acct", feed["id"] * 1_000_000_000 + abs(target) % 1_000_000_000, time.time()):
+            if emoji and _should_notify("acct", feed["id"] * 1_000_000_000 + abs(target) % 1_000_000_000,
+                                        time.time()):
                 await _safe_dm(
                     bot, feed["owner_id"],
                     f"ℹ️ Пост с премиум-эмодзи ушёл в канал {target} через бота, и Telegram мог заменить "
                     "эмодзи обычными. Чтобы они сохранялись, сделайте аккаунт-читатель (Premium) админом "
                     f"этого канала с правом публикации. Причина: {exc}",
                 )
-    await publish_fetched(bot, target, post.media, text, entities)
+    media = [m for m in post.media if not getattr(m, "big", False)]
+    if len(media) != len(post.media):
+        log.warning("В %s не отправлены файлы больше 20 МБ (%d): нужен служебный канал FEED_STAGING_CHAT и "
+                    "аккаунт-читатель", target, len(post.media) - len(media))
+    await publish_fetched(bot, target, media, text, entities)
 
 
 async def _clear_stage(bot: Any, reader: Reader, cfg: Optional[Config], stage: dict) -> None:

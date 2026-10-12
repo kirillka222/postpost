@@ -29,6 +29,8 @@ class MediaItem:
     thumb: Optional[bytes] = None
     # Исходное медиа Telethon: аккаунт может отправить его по ссылке, без перезаливки и с атрибутами
     source: Any = field(default=None, repr=False, compare=False)
+    # Файл больше лимита бота: не скачан (data пуст), уйти может только через аккаунт по ссылке
+    big: bool = False
 
 
 @dataclass

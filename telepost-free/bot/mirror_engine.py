@@ -35,7 +35,8 @@ async def _safe_dm(bot: Any, user_id: int, text: str) -> None:
 def default_rewriter(cfg: Config) -> Rewriter:
     async def _rw(text: str, style: str) -> str:
         return await llm.rewrite(
-            text, url=cfg.llm_url, model=cfg.llm_model, timeout=cfg.llm_timeout, style=style
+            text, url=cfg.llm_url, model=cfg.llm_model, timeout=cfg.llm_timeout, style=style,
+            api_key=cfg.llm_api_key,
         )
 
     return _rw

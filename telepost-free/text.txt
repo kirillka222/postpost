@@ -1,0 +1,37 @@
+# Токен от @BotFather (обязательно)
+BOT_TOKEN=8765920192:AAHsLVP1aEc96_B4j8xcU7_tYiSJN6B4Tlw
+
+# Нейро-рерайт: открытая модель Qwen3 в Ollama (бесплатно, свой сервер, без платных API)
+# В docker compose адрес подставляется автоматически (http://ollama:11434).
+LLM_URL=http://localhost:11434
+# qwen3:1.7b — для слабых серверов, qwen3:4b — баланс, qwen3:8b — лучше русский, нужно ~8+ ГБ RAM
+LLM_MODEL=qwen3:1.7b
+# Секунд на один рерайт (на CPU генерация медленная)
+LLM_TIMEOUT=180
+
+# Часовой пояс по умолчанию для отложенных постов
+DEFAULT_TZ=Europe/Moscow
+
+# Тариф Pro за Telegram Stars
+PRO_PRICE_STARS=150
+PRO_DAYS=30
+# Кому писать по вопросам оплаты (команда /paysupport), например @username
+SUPPORT_CONTACT=
+
+# Путь к базе (в compose лежит в томе ./data)
+DB_PATH=data/bot.sqlite3
+
+TG_API_ID=32464619
+TG_API_HASH=4cf36cc4dd5119187ac59be6673cbe15 # rm data/userbot.session
+TG_SESSION=data/userbot # docker compose run --rm bot python -m bot.login
+# Как часто проверять источники, секунд (не меньше 30)
+FEED_POLL_SECONDS=120
+
+FEEDS_ADMINS=7241565564
+
+ADMIN_IDS=7241565564
+MENU_EMOJI=
+
+FEED_STAGING_CHAT=-1004343593950
+
+
