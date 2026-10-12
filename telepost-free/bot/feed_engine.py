@@ -9,7 +9,9 @@ from typing import Any, Optional
 from .access import feeds_allowed
 from .config import Config
 from .db import Database
-from .entities import Entity, has_custom_emoji, remap_custom_emoji, strip_links
+from .entities import (
+    Entity, has_custom_emoji, mask_custom_emoji, remap_custom_emoji, restore_custom_emoji, strip_links,
+)
 from .feeds import MESSAGE_LIMIT, FetchedPost, Reader, compose_post, source_label
 from .mirror_engine import Rewriter, _safe_dm, _should_notify, default_rewriter, rewrite_with_quota
 from .publisher import copy_staged, publish_fetched, recent_sends
@@ -118,14 +120,20 @@ async def process_feed(
             log.info("Источник %s: ИИ переписывает пост %s (модель отвечает долго, это нормально)...", label,
                      post.message_ids)
             started = time.monotonic()
-            new = await rewrite_with_quota(bot, db, owner, text, feed["style"], rewriter)
+            # премиум-эмодзи прячем под метки [e1]...: так нейросеть их не теряет
+            masked, marks = mask_custom_emoji(text, entities) if has_custom_emoji(entities) else (text, {})
+            new = await rewrite_with_quota(bot, db, owner, masked, feed["style"], rewriter)
             log.info("Источник %s: рерайт %s за %.0f с", label,
                      "готов" if new is not None else "не получен (пост уйдёт без изменений)",
                      time.monotonic() - started)
             if new is not None:
                 # текст изменился: форматирование не переносим, а премиум-эмодзи возвращаем по порядку
-                entities = remap_custom_emoji(text, entities, new)
-                text = new
+                restored = restore_custom_emoji(new, marks) if marks else None
+                if restored is not None:
+                    text, entities = restored
+                else:
+                    entities = remap_custom_emoji(text, entities, new)  # запасной путь: по символам-заменителям
+                    text = new
                 if prefs["strip_links"]:
                     text, entities = strip_links(text, entities)  # модель могла дописать ссылку сама
         if not text.strip() and not post.media:

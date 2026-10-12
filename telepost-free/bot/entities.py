@@ -155,6 +155,63 @@ def remap_custom_emoji(original: str, entities: Iterable[Entity], new_text: str)
     return out
 
 
+_MARK = re.compile(r"[\[(]\s*e\s*(\d+)\s*[\])]", re.I)
+
+
+def mask_custom_emoji(text: str, entities: Iterable[Entity]) -> tuple[str, dict[int, tuple[str, str]]]:
+    """Заменяет каждое премиум-эмодзи меткой [e1], [e2]... для нейросети.
+
+    Обычный эмодзи-«заменитель» модель легко теряет или меняет, а метку с номером сохраняет надёжнее.
+    Возвращает текст с метками и таблицу: номер → (символ-заменитель, id премиум-эмодзи).
+    """
+    raw = text.encode("utf-16-le")
+    out: list[str] = []
+    marks: dict[int, tuple[str, str]] = {}
+    pos = 0
+    for e in sorted((x for x in entities if x.type == "custom_emoji" and x.custom_emoji_id),
+                    key=lambda x: x.offset):
+        start, end = e.offset * 2, (e.offset + e.length) * 2
+        ch = raw[start:end].decode("utf-16-le", errors="ignore")
+        if start < pos or not ch:
+            continue
+        n = len(marks) + 1
+        out.append(raw[pos:start].decode("utf-16-le", errors="ignore"))
+        out.append(f"[e{n}]")
+        marks[n] = (ch, e.custom_emoji_id or "")
+        pos = end
+    out.append(raw[pos:].decode("utf-16-le", errors="ignore"))
+    return "".join(out), marks
+
+
+def restore_custom_emoji(new_text: str, marks: dict[int, tuple[str, str]]) -> Optional[tuple[str, list[Entity]]]:
+    """Возвращает премиум-эмодзи на места меток в ответе нейросети.
+
+    None — модель не оставила ни одной метки (тогда работает запасной способ по порядку символов).
+    Лишние и повторные метки убираются, потерянные эмодзи просто не возвращаются.
+    """
+    if not _MARK.search(new_text):
+        return None
+    out: list[str] = []
+    ents: list[Entity] = []
+    used: set[int] = set()
+    pos = 0
+    length = 0
+    for m in _MARK.finditer(new_text):
+        piece = new_text[pos:m.start()]
+        out.append(piece)
+        length += u16len(piece)
+        pos = m.end()
+        n = int(m.group(1))
+        if n in marks and n not in used:
+            used.add(n)
+            ch, cid = marks[n]
+            ents.append(Entity("custom_emoji", length, u16len(ch), custom_emoji_id=cid))
+            out.append(ch)
+            length += u16len(ch)
+    out.append(new_text[pos:])
+    return "".join(out), ents
+
+
 def has_custom_emoji(entities: Iterable[Entity]) -> bool:
     return any(e.type == "custom_emoji" for e in entities)
 
