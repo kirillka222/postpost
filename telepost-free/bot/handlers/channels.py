@@ -115,12 +115,22 @@ async def cmd_channels(message: Message, db: Database, cfg: Config, state: Optio
 CONNECT_EMOJI_ID = "5312365458383474419"
 
 
+async def bot_mention(bot: Any) -> str:
+    """«@username» бота (берётся у Telegram, а не из кода: имя бота можно менять) или пустая строка."""
+    try:
+        name = getattr(await bot.me(), "username", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return f"@{name}" if name else ""
+
+
 @router.callback_query(F.data == "chadd")
-async def cb_add(cb: CallbackQuery, state: FSMContext) -> None:
+async def cb_add(cb: CallbackQuery, state: FSMContext, bot: Optional[Bot] = None) -> None:
     await state.set_state(AddChannel.waiting)
+    me = await bot_mention(bot) if bot is not None else ""
     body = (
         "Подключение канала:\n"
-        "1. Добавьте бота @pilotpost_robot в канал администратором с правами «Публикация сообщений», «Добавление "
+        f"1. Добавьте бота {me + ' ' if me else ''}в канал администратором с правами «Публикация сообщений», «Добавление "
         "администраторов» и «Добавление участников».\n"
         "2. Перешлите сюда любой пост из канала — или пришлите @username канала.\n\n"
         "{mark} Premium-бот будет добавлен автоматически для корректной работы премиум-эмодзи. "
@@ -277,11 +287,11 @@ def bot_rights_report(me: Any) -> str:
             + ("\nВыключены: " + ", ".join(off) if off else ""))
 
 
-def rights_text(missing: list[str]) -> str:
+def rights_text(missing: list[str], bot_name: str = "") -> str:
     """Что именно включить боту (названия — как в настройках администратора канала в Telegram)."""
     return (
         "⚠️ Premium-аккаунт не добавлен, поэтому премиум-эмодзи в этом канале работать не будут.\n\n"
-        "Включите боту @pilotpost_robot (канал → Управление → Администраторы → бот) права:\n"
+        f"Включите боту {bot_name + ' ' if bot_name else ''}(канал → Управление → Администраторы → бот) права:\n"
         + "\n".join(f"• «{name}»" for name in missing)
         + "\n\nЗатем отключите канал и подключите его заново."
     )
@@ -310,7 +320,7 @@ async def ensure_publisher(bot: Bot, reader: Any, chat_id: int) -> tuple[str, st
                                        ("Добавление участников", "can_invite_users"))
                if me is None or not getattr(me, attr, False)]
     if missing:
-        return "no_rights", rights_text(missing)
+        return "no_rights", rights_text(missing, await bot_mention(bot))
     link = None
     try:
         link = await bot.create_chat_invite_link(chat_id, name="premium-emoji", member_limit=1)

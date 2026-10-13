@@ -7,6 +7,7 @@ import time
 from typing import Any, Optional
 
 from .access import feeds_allowed
+from . import schedule
 from .config import Config
 from .db import Database
 from .entities import (
@@ -28,17 +29,30 @@ async def deliver(
     bot: Any, reader: Reader, cfg: Optional[Config], feed: dict, target: int,
     post: FetchedPost, text: str, entities: list[Entity], stage: Optional[dict] = None,
 ) -> None:
-    """Публикует пост в канал. Посты с премиум-эмодзи по возможности шлёт аккаунт-читатель (Premium,
-    админ канала): бот не может надёжно ставить премиум-эмодзи в каналы. Иначе публикует бот."""
+    """Публикует пост в канал.
+
+    Боты не умеют ставить премиум-эмодзи в каналы (ни отправкой, ни copyMessage), поэтому такие посты, как и
+    файлы больше 20 МБ, публикует аккаунт-читатель (Premium, админ канала) прямо в канал получателя.
+    Служебный канал (FEED_STAGING_CHAT) — запасной путь, если аккаунт не админ: бот копирует пост оттуда
+    (эмодзи при этом пропадают, зато пост выходит). Иначе публикует бот.
+    """
     via = (cfg.feed_publish_via if cfg is not None else "auto")
     big = any(getattr(m, "big", False) for m in post.media)  # файлы больше 20 МБ боту не по силам
     emoji = has_custom_emoji(entities)
     if hasattr(reader, "send") and (
         big or (via == "auto" and emoji and getattr(reader, "premium", False))
     ):
+        try:
+            ids = await reader.send(target, text, entities, post.media)  # type: ignore[attr-defined]
+            for mid in ids:
+                recent_sends.add(target, mid)
+            return
+        except Exception as exc:  # noqa: BLE001
+            direct_error = exc
+            log.warning("Публикация от имени аккаунта в %s не удалась: %s", target, exc)
         staging = cfg.feed_staging_chat if cfg is not None else 0
+        copied_ok = False
         if staging and stage is not None and not stage.get("failed"):
-            # Витрина: аккаунт один раз публикует пост в служебный канал, бот копирует его пользователю.
             try:
                 if "ids" not in stage:
                     stage["ids"] = await reader.send(staging, text, entities, post.media)  # type: ignore[attr-defined]
@@ -47,30 +61,26 @@ async def deliver(
                 copied = await copy_staged(bot, target, staging, stage["ids"],
                                            forward=(cfg is not None and cfg.feed_staging_mode == "forward"))
                 log.info("Витрина → %s: бот скопировал %s", target, copied)
-                return
+                copied_ok = True
             except Exception as exc:  # noqa: BLE001
                 if "ids" not in stage:
                     stage["failed"] = True  # не пробуем заново для остальных получателей этого поста
                 log.warning("Публикация через служебный канал %s в %s не удалась: %s", staging, target, exc)
-        try:
-            ids = await reader.send(target, text, entities, post.media)  # type: ignore[attr-defined]
-            for mid in ids:
-                recent_sends.add(target, mid)
+        if emoji and _should_notify(
+            "acct", feed["id"] * 1_000_000_000 + abs(target) % 1_000_000_000, time.time()
+        ):
+            await _safe_dm(
+                bot, feed["owner_id"],
+                f"ℹ️ Пост с премиум-эмодзи ушёл в канал {target} не от аккаунта, и Telegram мог заменить "
+                "эмодзи обычными. Чтобы они сохранялись, сделайте аккаунт-читатель (Premium) админом "
+                f"этого канала с правом публикации. Причина: {direct_error}",
+            )
+        if copied_ok:
             return
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Публикация от имени аккаунта в %s не удалась (%s), публикую ботом", target, exc)
-            if emoji and _should_notify("acct", feed["id"] * 1_000_000_000 + abs(target) % 1_000_000_000,
-                                        time.time()):
-                await _safe_dm(
-                    bot, feed["owner_id"],
-                    f"ℹ️ Пост с премиум-эмодзи ушёл в канал {target} через бота, и Telegram мог заменить "
-                    "эмодзи обычными. Чтобы они сохранялись, сделайте аккаунт-читатель (Premium) админом "
-                    f"этого канала с правом публикации. Причина: {exc}",
-                )
     media = [m for m in post.media if not getattr(m, "big", False)]
     if len(media) != len(post.media):
-        log.warning("В %s не отправлены файлы больше 20 МБ (%d): нужен служебный канал FEED_STAGING_CHAT и "
-                    "аккаунт-читатель", target, len(post.media) - len(media))
+        log.warning("В %s не отправлены файлы больше 20 МБ (%d): аккаунт-читатель должен быть админом канала",
+                    target, len(post.media) - len(media))
     await publish_fetched(bot, target, media, text, entities)
 
 
@@ -91,12 +101,49 @@ async def _clear_stage(bot: Any, reader: Reader, cfg: Optional[Config], stage: d
         log.info("Не удалось очистить служебный канал: %s", exc)
 
 
+async def _skip_to_latest(db: Database, reader: Reader, feed: dict) -> None:
+    """Пауза: посты, вышедшие за это время, не копим и не публикуем после включения."""
+    try:
+        latest = await reader.latest_id(feed["username"])
+    except Exception as exc:  # noqa: BLE001
+        log.info("Не удалось пропустить посты на паузе: %s", exc)
+        return
+    if latest > feed["last_msg_id"]:
+        await db.update_feed_last(feed["id"], latest)
+
+
+async def _gate(db: Database, reader: Reader, feed: dict, now_ts: int) -> str:
+    """Расписание владельца: 'free' / 'go' — можно читать источник, остальное — пропускаем цикл."""
+    owner = feed["owner_id"]
+    sched = await db.get_feed_schedule(owner)
+    user = await db.get_user(owner)
+    tz = (user or {}).get("tz") or "UTC"
+    last = int(feed.get("sched_last") or 0)
+    if sched["mode"] == "times" and not last and int(sched.get("paused_until") or 0) <= now_ts:
+        await db.set_feed_sched_last(feed["id"], now_ts)  # источник добавлен/режим включён: ждём ближайшее время
+        feed["sched_last"] = now_ts
+        return "wait"
+    state = schedule.check(sched, last, now_ts, tz)
+    if state == "paused":
+        await _skip_to_latest(db, reader, feed)
+    return state
+
+
 async def process_feed(
-    bot: Any, db: Database, reader: Reader, feed: dict, rewriter: Rewriter, cfg: Optional[Config] = None
+    bot: Any, db: Database, reader: Reader, feed: dict, rewriter: Rewriter, cfg: Optional[Config] = None,
+    now: Optional[float] = None,
 ) -> int:
     """Обрабатывает один источник. Возвращает число успешных публикаций."""
     owner, username = feed["owner_id"], feed["username"]
     label = source_label(username, feed["title"])
+    now_ts = int(time.time() if now is None else now)
+    if not feed["targets"]:
+        return 0  # каналы не выбраны: посты не читаем и не теряем, они дождутся выбора
+    state = await _gate(db, reader, feed, now_ts)
+    if state in ("paused", "quiet", "wait"):
+        return 0
+    scheduled = state == "go"  # по расписанию: один пост за раз
+    consumed = False
     try:
         posts = await asyncio.wait_for(reader.fetch_new(username, feed["last_msg_id"]), FETCH_TIMEOUT)
     except Exception as exc:  # noqa: BLE001
@@ -146,6 +193,7 @@ async def process_feed(
 
         stage: dict = {}
         post_ok = False
+        consumed = scheduled
         for target in feed["targets"]:
             try:
                 await deliver(bot, reader, cfg, feed, target, post, final, final_entities, stage)
@@ -167,8 +215,12 @@ async def process_feed(
             await db.bump_published(owner, feed=1)
         # id двигаем всегда: иначе недоставляемый пост будет повторяться бесконечно
         await db.update_feed_last(feed["id"], post.last_id)
+        if scheduled:
+            break  # один пост за слот расписания, остальные дождутся своей очереди
 
-    if posts:
+    if consumed:
+        await db.set_feed_sched_last(feed["id"], now_ts)
+    elif posts:
         await db.update_feed_last(feed["id"], max(p.last_id for p in posts))
     return delivered
 

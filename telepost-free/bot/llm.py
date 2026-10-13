@@ -80,7 +80,7 @@ def restore_links(original: str, rewritten: str) -> str:
 
 def _post_json(url: str, payload: dict[str, Any], timeout: int, api_key: str = "") -> dict[str, Any]:
     # User-Agent обязателен: Cloudflare перед API (Groq и др.) отклоняет стандартный «Python-urllib»
-    headers = {"Content-Type": "application/json", "User-Agent": "pilotpost-bot/1.0", "Accept": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": "flypost-bot/1.0", "Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")

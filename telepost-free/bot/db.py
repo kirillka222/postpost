@@ -70,6 +70,15 @@ CREATE TABLE IF NOT EXISTS feed_prefs (
     footer TEXT NOT NULL DEFAULT '',
     footer_entities TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS feed_schedule (
+    owner_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'off',
+    every INTEGER NOT NULL DEFAULT 60,
+    times TEXT NOT NULL DEFAULT '[]',
+    quiet_from TEXT NOT NULL DEFAULT '',
+    quiet_to TEXT NOT NULL DEFAULT '',
+    paused_until INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS feed_targets (
     feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
     chat_id INTEGER NOT NULL,
@@ -112,6 +121,9 @@ class Database:
             ):
                 if name not in ucols:  # данные для админки
                     conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+            if "sched_last" not in {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}:
+                # когда источник последний раз публиковал по расписанию
+                conn.execute("ALTER TABLE feeds ADD COLUMN sched_last INTEGER NOT NULL DEFAULT 0")
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(posts)")}
             if "payload" not in cols:  # снимок поста с премиум-эмодзи для публикации от имени аккаунта
                 conn.execute("ALTER TABLE posts ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
@@ -586,6 +598,37 @@ class Database:
 
         await self._run(q)
 
+    async def get_feed_schedule(self, owner_id: int) -> dict:
+        """Расписание нейропостинга владельца (одно на все его источники)."""
+        def q(c: sqlite3.Connection) -> dict:
+            r = c.execute("SELECT * FROM feed_schedule WHERE owner_id=?", (owner_id,)).fetchone()
+            if r is None:
+                return {"mode": "off", "every": 60, "times": [], "quiet_from": "", "quiet_to": "",
+                        "paused_until": 0}
+            return {"mode": r["mode"], "every": r["every"], "times": json.loads(r["times"] or "[]"),
+                    "quiet_from": r["quiet_from"], "quiet_to": r["quiet_to"], "paused_until": r["paused_until"]}
+
+        return await self._run(q)
+
+    async def set_feed_schedule(self, owner_id: int, **fields: Any) -> None:
+        allowed = {"mode", "every", "times", "quiet_from", "quiet_to", "paused_until"}
+        if not fields or set(fields) - allowed:
+            raise ValueError(f"Неизвестные поля расписания: {set(fields) - allowed}")
+        if "times" in fields:
+            fields["times"] = json.dumps(list(fields["times"]))
+
+        def q(c: sqlite3.Connection) -> None:
+            c.execute("INSERT OR IGNORE INTO feed_schedule(owner_id) VALUES(?)", (owner_id,))
+            sets = ", ".join(f"{k}=?" for k in fields)
+            c.execute(f"UPDATE feed_schedule SET {sets} WHERE owner_id=?", (*fields.values(), owner_id))
+            if fields.get("mode") is not None or "times" in fields:  # новый режим/время: отсчёт заново
+                c.execute("UPDATE feeds SET sched_last=0 WHERE owner_id=?", (owner_id,))
+
+        await self._run(q)
+
+    async def set_feed_sched_last(self, feed_id: int, ts: int) -> None:
+        await self._run(lambda c: c.execute("UPDATE feeds SET sched_last=? WHERE id=?", (ts, feed_id)))
+
     async def list_feeds(self, owner_id: int) -> list[dict]:
         return await self._run(
             lambda c: self._feeds_with_targets(
@@ -631,6 +674,51 @@ class Database:
             return bool(new)
 
         return await self._run(fn)
+
+    async def toggle_feed_target(self, owner_id: int, feed_id: int, chat_id: int) -> Optional[str]:
+        """Добавляет/убирает канал у источника: 'added' | 'removed' | None (источник или канал не ваши)."""
+        def fn(c: sqlite3.Connection) -> Optional[str]:
+            if not c.execute("SELECT 1 FROM feeds WHERE id=? AND owner_id=?", (feed_id, owner_id)).fetchone():
+                return None
+            if not c.execute("SELECT 1 FROM channels WHERE owner_id=? AND chat_id=?", (owner_id, chat_id)).fetchone():
+                return None
+            if c.execute("SELECT 1 FROM feed_targets WHERE feed_id=? AND chat_id=?", (feed_id, chat_id)).fetchone():
+                c.execute("DELETE FROM feed_targets WHERE feed_id=? AND chat_id=?", (feed_id, chat_id))
+                return "removed"
+            c.execute("INSERT INTO feed_targets(feed_id, chat_id) VALUES (?,?)", (feed_id, chat_id))
+            return "added"
+
+        return await self._run(fn)
+
+    async def set_all_feed_targets(self, owner_id: int, feed_id: int, enable: bool = True) -> bool:
+        """Публиковать источник во все ваши каналы (enable) или ни в один."""
+        def fn(c: sqlite3.Connection) -> bool:
+            if not c.execute("SELECT 1 FROM feeds WHERE id=? AND owner_id=?", (feed_id, owner_id)).fetchone():
+                return False
+            if enable:
+                c.execute(
+                    "INSERT OR IGNORE INTO feed_targets(feed_id, chat_id) "
+                    "SELECT ?, chat_id FROM channels WHERE owner_id=?", (feed_id, owner_id),
+                )
+            else:
+                c.execute("DELETE FROM feed_targets WHERE feed_id=?", (feed_id,))
+            return True
+
+        return await self._run(fn)
+
+    async def set_channel_feeds(self, owner_id: int, chat_id: int, enable: bool) -> None:
+        """Подключает канал ко всем источникам (enable) или отключает от всех."""
+        def fn(c: sqlite3.Connection) -> None:
+            if not c.execute("SELECT 1 FROM channels WHERE owner_id=? AND chat_id=?", (owner_id, chat_id)).fetchone():
+                return
+            ids = [r[0] for r in c.execute("SELECT id FROM feeds WHERE owner_id=?", (owner_id,)).fetchall()]
+            for fid in ids:
+                if enable:
+                    c.execute("INSERT OR IGNORE INTO feed_targets(feed_id, chat_id) VALUES (?,?)", (fid, chat_id))
+                else:
+                    c.execute("DELETE FROM feed_targets WHERE feed_id=? AND chat_id=?", (fid, chat_id))
+
+        await self._run(fn)
 
     async def set_feed_style(self, owner_id: int, feed_id: int, style: str) -> bool:
         return await self._run(

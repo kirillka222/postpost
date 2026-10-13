@@ -331,4 +331,14 @@ class TelethonReader:
                 sent.extend(res if isinstance(res, list) else [res])
             if text and not caption:
                 sent.append(await self.client.send_message(peer, text, parse_mode=parse))
+        if tl_entities:
+            def count(entities: Any) -> int:
+                return sum(1 for e in entities or [] if type(e).__name__ == "MessageEntityCustomEmoji")
+
+            want, kept = count(tl_entities), sum(count(getattr(m, "entities", None)) for m in sent)
+            if want:  # диагностика: принял ли Telegram премиум-эмодзи (аккаунт без Premium их теряет)
+                log.info("Аккаунт отправил в %s: премиум-эмодзи сохранилось %d из %d", chat_id, kept, want)
+                if kept < want:
+                    log.warning("Telegram не оставил премиум-эмодзи в посте: проверьте, что у аккаунта-читателя "
+                                "есть Telegram Premium")
         return [int(m.id) for m in sent]
