@@ -85,6 +85,26 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(watermark.WatermarkError):
             await watermark.apply_items([MediaItem("photo", b"not an image", "p.jpg")], SPEC)
 
+    async def test_big_photo_is_fetched_by_account(self):
+        big = MediaItem("photo", b"", "p.jpg", source="SRC", big=True, size=50 * 2**20)
+
+        async def fetch(item):
+            return jpeg()
+
+        out = await watermark.apply_items([big], SPEC, fetch)
+        self.assertTrue(out[0].force_account)  # дальше публикует только аккаунт: боту такой файл не отдать
+        self.assertFalse(out[0].big)
+        self.assertEqual(Image.open(io.BytesIO(out[0].data)).format, "JPEG")
+        huge = MediaItem("video", b"", "v.mp4", source="SRC", big=True, size=watermark.MAX_BIG_BYTES + 1)
+        with self.assertRaises(watermark.WatermarkError):
+            await watermark.apply_items([huge], SPEC, fetch)
+
+        async def broken(item):
+            raise RuntimeError("FLOOD")
+
+        with self.assertRaises(watermark.WatermarkError):
+            await watermark.apply_items([big], SPEC, broken)
+
     @unittest.skipUnless(watermark.find_ffmpeg(), "нет ffmpeg")
     async def test_video(self):
         import subprocess
@@ -136,6 +156,25 @@ class PublishTests(unittest.IsolatedAsyncioTestCase):
         _, text, _, media = reader.sent[0]
         self.assertEqual(text, "подпись")
         self.assertNotEqual(media[0].data, jpeg())
+
+    async def test_big_file_watermarked_through_staging(self):
+        class Bot(DlBot):
+            big = True
+
+        class Reader(AccountReader):
+            staging_chat = -500
+
+            async def media_from(self, chat_id, ids):
+                return [MediaItem("photo", b"", "p.jpg", source="SRC", size=60 * 2**20)]
+
+            async def download_item(self, item):
+                return jpeg()
+
+        reader, bot = Reader(), Bot()
+        ids = await publisher.publish_post(bot, -100, 5, 1, "media", None, None, self.payload, reader, [], None, SPEC)
+        self.assertEqual(ids, [9001])
+        self.assertNotEqual(reader.sent[0][3][0].data, jpeg())
+        self.assertIn("delete", bot.names())  # служебный канал почищен
 
     async def test_failure_never_publishes_without_mark(self):
         bot = DlBot()  # download отдаёт не картинку
@@ -210,6 +249,48 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         await wm_handler.got_text(msg, state, self.db)
         self.assertIn("❌", msg.out[-1][1])
         self.assertEqual((await self.db.get_watermark(1))["text"], "")
+
+
+class DoubleClickTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_click_while_publishing_is_ignored(self):
+        import asyncio
+
+        db = Database(":memory:")
+        await db.connect()
+        await db.ensure_user(1, "UTC")
+        await db.add_channel(1, -100, "Канал", "")
+        gate, calls = asyncio.Event(), []
+
+        class SlowBot(DlBot):
+            async def copy_message(self, **kw):
+                calls.append(kw)
+                await gate.wait()
+                return await super().copy_message(**kw)
+
+        bot, state = SlowBot(), FakeState()
+        await state.set_data({"selected": [-100], "options": {}, "src_chat": 1, "src_msg": 7, "kind": "media"})
+        await state.set_state(posting.Draft.menu)
+        msg = FakeMsg(user_id=1, message_id=5)
+        msg.delete = lambda: _noop(msg)
+        cfg = Config(bot_token="x")
+        first = asyncio.create_task(posting.go(FakeCb("dgo:now", msg, user_id=1), bot, state, db, cfg))
+        await asyncio.sleep(0.05)
+        await posting.go(FakeCb("dgo:now", msg, user_id=1), bot, state, db, cfg)  # повторное нажатие
+        await posting.go(FakeCb("dgo:now", msg, user_id=1), bot, state, db, cfg)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("обрабатывается", msg.out[0][1])  # пока ждём: текст без кнопок
+        self.assertIsNone(msg.out[0][2])
+        gate.set()
+        await first
+        self.assertEqual(len(calls), 1)  # пост вышел один раз
+        self.assertTrue(getattr(msg, "deleted", False))  # «обрабатывается» удалено
+        self.assertEqual(msg.out[-1][0], "answer")
+        self.assertIn("успешно опубликован", msg.out[-1][1])
+        await db.close()
+
+
+async def _noop(msg):
+    msg.deleted = True
 
 
 class DraftTests(unittest.IsolatedAsyncioTestCase):

@@ -35,6 +35,7 @@ class Draft(StatesGroup):
 # Альбом приходит отдельными сообщениями: первое собирает остальные в течение ALBUM_WAIT секунд
 ALBUM_WAIT = 1.2
 _album_buf: dict[str, list[Message]] = {}
+_publishing: set[tuple[int, int]] = set()  # черновики, которые прямо сейчас публикуются
 
 
 def _not_command(message: Message) -> bool:
@@ -344,19 +345,39 @@ async def go(
         return
 
     if action == "now":
-        await cb.answer()
-        ok, errors, notes = await _publish_now(bot, db, user_id, data, reader)
-        if ok:
-            await db.bump_published(user_id, manual=1)
-        await state.clear()
-        text = ""
-        if ok:
-            text += "✅ Опубликовано: " + ", ".join(ok)
-        if errors:
-            text += ("\n\n" if text else "") + "⚠️ Не удалось:\n" + "\n".join(errors)
-        if notes:
-            text += "\n\nℹ️ " + "\n".join(notes)
-        await cb.message.edit_text(text or "Каналы не найдены — подключите их заново: /channels")
+        # Публикация (особенно видео со знаком) долгая: повторные нажатия не должны выложить пост несколько раз.
+        # Проверка и пометка идут без await между ними, поэтому два нажатия подряд не пройдут вместе.
+        key = (user_id, cb.message.message_id)
+        if key in _publishing:
+            await cb.answer()  # повторное нажатие молча игнорируем: пост уже в работе
+            return
+        _publishing.add(key)
+        try:
+            await cb.answer()
+            try:  # без кнопок: нажать повторно нечем
+                await cb.message.edit_text("⏳ Пост обрабатывается… Видео может занять несколько минут, "
+                                           "повторно ничего нажимать не нужно.")
+            except Exception as exc:  # noqa: BLE001
+                log.info("Не удалось показать «пост обрабатывается»: %s", exc)
+            ok, errors, notes = await _publish_now(bot, db, user_id, data, reader)
+            if ok:
+                await db.bump_published(user_id, manual=1)
+            await state.clear()
+            text = ""
+            if ok:
+                text += "✅ Пост успешно опубликован: " + ", ".join(ok)
+            if errors:
+                text += ("\n\n" if text else "") + "⚠️ Не удалось:\n" + "\n".join(errors)
+            if notes:
+                text += "\n\nℹ️ " + "\n".join(notes)
+            text = text or "Каналы не найдены — подключите их заново: /channels"
+            try:  # сообщение «обрабатывается» убираем, итог приходит новым сообщением (с уведомлением)
+                await cb.message.delete()
+            except Exception as exc:  # noqa: BLE001
+                log.info("Не удалось удалить сообщение «пост обрабатывается»: %s", exc)
+            await cb.message.answer(text)
+        finally:
+            _publishing.discard(key)
         return
 
     if action == "later":
