@@ -22,6 +22,7 @@ async def run_due_posts(bot: Any, db: Database, now: Optional[int] = None, reade
         ok_titles: list[str] = []
         errors: list[str] = []
         notes: list[str] = []
+        wm = await db.get_watermark(post["owner_id"]) if (post.get("options") or {}).get("watermark") else None
         for chat_id in post["chat_ids"]:
             channel = await db.get_channel(post["owner_id"], chat_id)
             title = channel["title"] if channel else str(chat_id)
@@ -29,7 +30,7 @@ async def run_due_posts(bot: Any, db: Database, now: Optional[int] = None, reade
                 await publish_post(
                     bot, chat_id, post["src_chat"], post["src_msg"],
                     post["kind"], post["text_override"], post.get("extra_msgs"),
-                    post.get("payload"), reader, notes, post.get("options"),
+                    post.get("payload"), reader, notes, post.get("options"), wm,
                 )
                 ok_titles.append(title)
             except Exception as exc:  # noqa: BLE001

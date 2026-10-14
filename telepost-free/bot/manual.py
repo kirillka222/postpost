@@ -39,10 +39,11 @@ def message_media(message: Any) -> Optional[dict]:
     return None
 
 
-def build_payload(messages: list[Any]) -> Optional[dict]:
+def build_payload(messages: list[Any], force: bool = False) -> Optional[dict]:
     """Снимок поста (одно сообщение или альбом) для публикации от имени аккаунта.
 
     None — если в тексте нет премиум-эмодзи или в посте есть то, что аккаунту не передать (стикер, голосовое и т.п.).
+    force=True — снимок нужен и без премиум-эмодзи (например, чтобы наложить водяной знак на файлы поста).
     """
     text, entities = "", []
     for m in messages:
@@ -50,7 +51,7 @@ def build_payload(messages: list[Any]) -> Optional[dict]:
         if t:
             text, entities = t, e
             break
-    if not has_custom_emoji(entities):
+    if not force and not has_custom_emoji(entities):
         return None
     media: list[dict] = []
     for m in messages:

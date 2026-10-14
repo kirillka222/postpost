@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS feed_schedule (
     quiet_to TEXT NOT NULL DEFAULT '',
     paused_until INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS watermarks (
+    owner_id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL DEFAULT '',
+    pos TEXT NOT NULL DEFAULT 'br',
+    size INTEGER NOT NULL DEFAULT 30,
+    opacity INTEGER NOT NULL DEFAULT 60,
+    feeds INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS feed_targets (
     feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
     chat_id INTEGER NOT NULL,
@@ -623,6 +631,30 @@ class Database:
             c.execute(f"UPDATE feed_schedule SET {sets} WHERE owner_id=?", (*fields.values(), owner_id))
             if fields.get("mode") is not None or "times" in fields:  # новый режим/время: отсчёт заново
                 c.execute("UPDATE feeds SET sched_last=0 WHERE owner_id=?", (owner_id,))
+
+        await self._run(q)
+
+    async def get_watermark(self, owner_id: int) -> dict:
+        """Настройки водяного знака владельца: текст, положение, размер, прозрачность, нейропостинг."""
+        from .watermark import normalize
+
+        def q(c: sqlite3.Connection) -> dict:
+            r = c.execute("SELECT * FROM watermarks WHERE owner_id=?", (owner_id,)).fetchone()
+            return normalize(dict(r) if r else None)
+
+        return await self._run(q)
+
+    async def set_watermark(self, owner_id: int, **fields: Any) -> None:
+        allowed = {"text", "pos", "size", "opacity", "feeds"}
+        if not fields or set(fields) - allowed:
+            raise ValueError(f"Неизвестные поля водяного знака: {set(fields) - allowed}")
+        if "feeds" in fields:
+            fields["feeds"] = int(bool(fields["feeds"]))
+
+        def q(c: sqlite3.Connection) -> None:
+            c.execute("INSERT OR IGNORE INTO watermarks(owner_id) VALUES(?)", (owner_id,))
+            sets = ", ".join(f"{k}=?" for k in fields)
+            c.execute(f"UPDATE watermarks SET {sets} WHERE owner_id=?", (*fields.values(), owner_id))
 
         await self._run(q)
 

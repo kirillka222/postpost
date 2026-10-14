@@ -7,7 +7,7 @@ from typing import Optional
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..config import Config
 from ..db import Database
@@ -120,7 +120,9 @@ async def menu_settings(message: Message, state: FSMContext, db: Database, cfg: 
         f"🕒 Часовой пояс: {user['tz']}\n"
         "Изменить: /tz Europe/Moscow, /tz Asia/Yekaterinburg или /tz +3. По нему считается время отложенных постов.\n\n"
         f"⭐ Тариф: {plan.name}. Лимиты и оплата — кнопка «{MENU_PRO_TEXT}».\n\n"
-        "🤖 Чистка чужих ссылок, своя подпись и премиум-эмодзи настраиваются в разделе «Нейропостинг»."
+        "🤖 Чистка чужих ссылок, своя подпись и премиум-эмодзи настраиваются в разделе «Нейропостинг».",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💧 Водяной знак", callback_data="wm:open")]]),
     )
 
 

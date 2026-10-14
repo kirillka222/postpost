@@ -10,7 +10,7 @@ from aiogram.types import BotCommand
 from .config import load_config
 from .db import Database
 from .feed_engine import feed_loop
-from .handlers import admin, billing, channels, common, discussion, fallback, feeds, posting
+from .handlers import admin, billing, channels, common, discussion, fallback, feeds, posting, watermark
 from .middleware import activity_middleware
 from .scheduler import scheduler_loop
 
@@ -20,6 +20,7 @@ COMMANDS = [
     BotCommand(command="channels", description="Мои каналы"),
     BotCommand(command="queue", description="План постов"),
     BotCommand(command="feeds", description="Нейропостинг из других каналов"),
+    BotCommand(command="watermark", description="Водяной знак на фото и видео"),
     BotCommand(command="tz", description="Часовой пояс"),
     BotCommand(command="pro", description="Тарифы и лимиты"),
     BotCommand(command="cancel", description="Отменить действие"),
@@ -59,7 +60,7 @@ async def main() -> None:
         try:
             from .telethon_reader import TelethonReader
 
-            candidate = TelethonReader.create(cfg.tg_api_id, cfg.tg_api_hash, cfg.tg_session)
+            candidate = TelethonReader.create(cfg.tg_api_id, cfg.tg_api_hash, cfg.tg_session, cfg.tg_session_string)
             if await candidate.start():
                 reader = candidate
                 if not candidate.premium:
@@ -82,7 +83,7 @@ async def main() -> None:
     # порядок важен: posting ловит «любое сообщение» и должен идти последним
     dp.message.outer_middleware(activity_middleware)
     dp.callback_query.outer_middleware(activity_middleware)
-    dp.include_routers(discussion.router, admin.router, common.router, channels.router, feeds.router, billing.router, posting.router, fallback.router)
+    dp.include_routers(discussion.router, admin.router, common.router, channels.router, feeds.router, billing.router, watermark.router, posting.router, fallback.router)
 
     scheduler = asyncio.create_task(scheduler_loop(bot, db, reader))
     feed_task = asyncio.create_task(feed_loop(bot, db, cfg, reader)) if reader else None

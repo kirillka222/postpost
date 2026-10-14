@@ -67,7 +67,8 @@ def _bot_entities(entities: list[Any]) -> list[Any]:
 
 
 async def publish_fetched(
-    bot: Any, chat_id: int, items: list[Any], text: str, entities: Optional[list[Any]] = None
+    bot: Any, chat_id: int, items: list[Any], text: str, entities: Optional[list[Any]] = None,
+    flags: Optional[dict] = None, markup: Any = None,
 ) -> list[int]:
     """Публикует пост, скачанный из чужого канала: текст с оформлением и/или файлы (альбом до 10).
 
@@ -78,12 +79,12 @@ async def publish_fetched(
 
     entities = list(entities or [])
     try:
-        return await _publish_fetched(bot, chat_id, items, text, entities)
+        return await _publish_fetched(bot, chat_id, items, text, entities, flags, markup)
     except Exception:  # noqa: BLE001
         if not has_custom_emoji(entities):
             raise
         log.warning("Telegram отклонил премиум-эмодзи в %s, публикую без них", chat_id)
-        return await _publish_fetched(bot, chat_id, items, text, without_custom_emoji(entities))
+        return await _publish_fetched(bot, chat_id, items, text, without_custom_emoji(entities), flags, markup)
 
 
 def _video_params(item: Any, input_file: Any) -> dict[str, Any]:
@@ -101,16 +102,19 @@ def _video_params(item: Any, input_file: Any) -> dict[str, Any]:
 
 
 async def _publish_fetched(
-    bot: Any, chat_id: int, items: list[Any], text: str, entities: list[Any]
+    bot: Any, chat_id: int, items: list[Any], text: str, entities: list[Any],
+    flags: Optional[dict] = None, markup: Any = None,
 ) -> list[int]:
     from aiogram.types import BufferedInputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 
     ids: list[int] = []
     text = text or ""
+    flags = dict(flags or {})
+    kb_kw: dict[str, Any] = {"reply_markup": markup} if markup is not None else {}
     tg_entities = _bot_entities(entities) if entities else []
     if not items:
         if text.strip():
-            kw0: dict[str, Any] = {"chat_id": chat_id, "text": text[:MESSAGE_LIMIT]}
+            kw0: dict[str, Any] = {"chat_id": chat_id, "text": text[:MESSAGE_LIMIT], **flags, **kb_kw}
             if tg_entities:
                 kw0["entities"] = tg_entities
             res = await _with_retry(bot.send_message, **kw0)
@@ -130,6 +134,8 @@ async def _publish_fetched(
                     "chat_id": chat_id,
                     arg: BufferedInputFile(item.data, filename=item.filename),
                     **_video_params(item, BufferedInputFile),
+                    **flags,
+                    **(kb_kw if len(items) == 1 else {}),
                 }
                 if n == 0 and caption:
                     kw["caption"] = caption
@@ -147,10 +153,10 @@ async def _publish_fetched(
                 )
                 for n, item in enumerate(items)
             ]
-            sent = await _with_retry(bot.send_media_group, chat_id=chat_id, media=media)
+            sent = await _with_retry(bot.send_media_group, chat_id=chat_id, media=media, **flags)
             ids.extend(m.message_id for m in sent)
         if extra:
-            kw1: dict[str, Any] = {"chat_id": chat_id, "text": extra[:MESSAGE_LIMIT]}
+            kw1: dict[str, Any] = {"chat_id": chat_id, "text": extra[:MESSAGE_LIMIT], **flags}
             if tg_entities:
                 kw1["entities"] = tg_entities
             res = await _with_retry(bot.send_message, **kw1)
@@ -253,12 +259,24 @@ async def publish_post(
     reader: Any = None,
     notes: Optional[list[str]] = None,
     options: Optional[dict] = None,
+    watermark: Optional[dict] = None,
 ) -> list[int]:
     """Публикует копию сообщения (src_chat, src_msg) в chat_id.
 
     kind: "text" — обычный текст, "media" — всё остальное (подпись можно заменить).
+    watermark — настройки водяного знака: его накладывают на фото и видео из payload (снимок поста); если знак
+    нанести не вышло, пост не публикуется (WatermarkError), чтобы в канал не попал файл без знака.
     """
+    from .watermark import WatermarkError, apply_items, has_visual, ready
+
     ids: list[int] = []
+    if watermark is not None and not ready(watermark):
+        raise WatermarkError("текст водяного знака не задан (Настройки → Водяной знак)")
+    has_media = has_visual(payload)
+    if watermark is not None and kind != "text" and not has_media:
+        if notes is not None:
+            notes.append("водяной знак не наложен: этот тип вложения (стикер, голосовое…) он не поддерживает")
+        watermark = None
     opts = postopts.normalize(options)
     flags: dict[str, Any] = {}
     if opts["silent"]:
@@ -291,6 +309,8 @@ async def publish_post(
                 items, staged = await _stage_media(bot, reader, staging, src_chat, [src_msg, *(extra_msgs or [])])
                 log.info("Файл больше лимита Bot API (%s): беру медиа из служебного канала %s", exc, staging)
             try:
+                if watermark is not None:
+                    items = await apply_items(items, watermark)
                 ids = [int(i) for i in await reader.send(chat_id, text, entities, items)]
             finally:
                 if staged:
@@ -299,12 +319,29 @@ async def publish_post(
                 recent_sends.add(chat_id, mid)
             await _after_publish(bot, chat_id, ids, opts, kb, notes, via_account=True)
             return ids
+        except WatermarkError:
+            raise
         except Exception as exc:  # noqa: BLE001
             log.warning("Публикация от имени аккаунта в %s не удалась (%s), публикую ботом", chat_id, exc)
             if notes is not None:
                 notes.append(
                     "премиум-эмодзи могли стать обычными: аккаунт не смог опубликовать пост. Проверьте, что "
                     f"Premium-аккаунт — администратор канала с правом «Публикация сообщений». Причина: {exc}")
+
+    if watermark is not None and has_media and text_override is None:
+        # водяной знак: файлы скачиваем, накладываем знак и публикуем заново (копия Telegram знака не несёт)
+        from .manual import load_payload
+
+        try:
+            text, entities, items = await load_payload(bot, payload)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            raise WatermarkError(f"не удалось скачать файлы поста: {exc}") from exc
+        items = await apply_items(items, watermark)
+        many = len(items) > 1
+        ids = await publish_fetched(bot, chat_id, items, text, entities, flags=flags,
+                                    markup=None if many else kb)
+        await _after_publish(bot, chat_id, ids, opts, kb if many else None, notes, via_account=False, album=many)
+        return ids
 
     if kind == "album" and extra_msgs:
         # альбом копируется целиком, с подписями и группировкой (copy_messages сохраняет альбом)

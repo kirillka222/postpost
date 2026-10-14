@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any, Optional
 
 from .access import feeds_allowed
-from . import schedule
+from . import schedule, watermark
 from .config import Config
 from .db import Database
 from .entities import (
@@ -158,6 +159,8 @@ async def process_feed(
     log.info("Источник %s: новых постов %d (после id %d)", label, len(posts), feed["last_msg_id"])
     prefs = await db.get_feed_prefs(owner)
     footer_entities = [Entity(**d) for d in prefs["footer_entities"]]
+    wm = await db.get_watermark(owner)
+    wm_on = wm["feeds"] and watermark.ready(wm)
     delivered = 0
     for post in posts[-MAX_BACKLOG:]:
         text, entities = post.text, post.entities
@@ -190,6 +193,20 @@ async def process_feed(
         final, final_entities = compose_post(text, entities, username, feed["credit"], MESSAGE_LIMIT,
                                              title=feed["title"], footer=prefs["footer"],
                                              footer_entities=footer_entities)
+
+        if wm_on and any(m.kind in ("photo", "video") for m in post.media):
+            try:
+                post = replace(post, media=await watermark.apply_items(post.media, wm))
+            except Exception as exc:  # noqa: BLE001 — пост без знака не публикуем
+                log.warning("Источник %s: водяной знак на посте %s не нанесён: %s", label, post.message_ids, exc)
+                if _should_notify("wm", feed["id"], time.time()):
+                    await _safe_dm(bot, owner, f"⚠️ Пост из {label} пропущен: не удалось наложить водяной знак "
+                                               f"({exc}). Отключить знак для нейропостинга: /watermark")
+                await db.update_feed_last(feed["id"], post.last_id)
+                consumed = scheduled
+                if scheduled:
+                    break
+                continue
 
         stage: dict = {}
         post_ok = False

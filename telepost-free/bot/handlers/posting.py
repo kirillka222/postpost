@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .. import postopts
+from .. import postopts, watermark
 from ..config import Config
 from ..db import Database
 from ..manual import build_payload
@@ -46,7 +46,9 @@ def _short(title: str, n: int = 28) -> str:
     return title if len(title) <= n else title[: n - 1] + "…"
 
 
-def draft_kb(channels: list[dict], selected: list[int], options: Optional[dict] = None) -> InlineKeyboardMarkup:
+def draft_kb(
+    channels: list[dict], selected: list[int], options: Optional[dict] = None, media: bool = False,
+) -> InlineKeyboardMarkup:
     opts = postopts.normalize(options)
     rows: list[list[InlineKeyboardButton]] = []
     for ch in channels:
@@ -65,6 +67,9 @@ def draft_kb(channels: list[dict], selected: list[int], options: Optional[dict] 
     ])
     rows.append([InlineKeyboardButton(
         text="🚫 Без комментариев" if opts["nocomments"] else "💬 Комментарии", callback_data="dop:nocomments")])
+    if media:  # знак накладывается на фото и видео, у текстового поста его нет
+        rows.append([InlineKeyboardButton(
+            text="💧 ✅ Водяной знак" if opts["watermark"] else "💧 Водяной знак", callback_data="dop:watermark")])
     n = postopts.count_buttons(opts["buttons"])
     rows.append([InlineKeyboardButton(text=f"🔗 Кнопки ({n})" if n else "🔗 Добавить кнопки",
                                       callback_data="dbt:edit")])
@@ -105,6 +110,8 @@ def draft_text(data: dict, total: Optional[int] = None, rich: bool = True) -> st
     n = postopts.count_buttons(postopts.normalize(data.get("options"))["buttons"])
     if n:
         info.append(f"🔗 Кнопок под постом: {n}")
+    if postopts.normalize(data.get("options"))["watermark"]:
+        info.append("💧 Водяной знак будет наложен на фото и видео")
     if info:
         lines += ["", *info]
     lines += ["", f"<blockquote>{PARAMS_HELP}</blockquote>"]
@@ -113,7 +120,7 @@ def draft_text(data: dict, total: Optional[int] = None, rich: bool = True) -> st
 
 async def _send_draft(send: Any, data: dict, channels: list[dict], **kw: Any) -> None:
     """Показывает черновик (send — answer/reply/edit_text). Если Telegram не принял премиум-эмодзи — обычный."""
-    kb = draft_kb(channels, data["selected"], data.get("options"))
+    kb = draft_kb(channels, data["selected"], data.get("options"), media=watermark.has_visual(data.get("wm") or data.get("payload")))
     try:
         await send(draft_text(data, len(channels)), reply_markup=kb, parse_mode="HTML", **kw)
     except Exception:  # noqa: BLE001 — например, у владельца бота нет Premium
@@ -160,6 +167,8 @@ async def new_draft(
         "selected": [channels[0]["chat_id"]] if len(channels) == 1 else [],
     }
     # Пост с премиум-эмодзи публикует аккаунт (Premium, админ канала): запоминаем текст, оформление и файлы
+    if not is_text:  # снимок файлов для водяного знака: нужен и без премиум-эмодзи
+        data["wm"] = build_payload(album_msgs or [message], force=True)
     if reader is not None and getattr(reader, "premium", False):
         data["payload"] = build_payload(album_msgs or [message])
         log.info("Черновик пользователя %s: премиум-эмодзи %s, публикация через аккаунт %s", user_id,
@@ -213,6 +222,14 @@ async def toggle_option(cb: CallbackQuery, state: FSMContext, db: Database) -> N
         await cb.answer()
         return
     opts = postopts.normalize(data.get("options"))
+    if flag == "watermark" and not opts[flag]:
+        wm = await db.get_watermark(cb.from_user.id)
+        if not watermark.ready(wm):
+            await cb.answer("Сначала задайте текст знака: /watermark", show_alert=True)
+            return
+        if not watermark.has_visual(data.get("wm") or data.get("payload")):
+            await cb.answer("К этому вложению знак не наложить (поддерживаются фото и видео)", show_alert=True)
+            return
     opts[flag] = not opts[flag]
     data["options"] = opts
     await state.set_data(data)
@@ -277,12 +294,21 @@ async def got_buttons(message: Message, state: FSMContext, db: Database) -> None
     await _send_draft(message.answer, data, await db.list_channels(message.from_user.id))
 
 
+def post_payload(data: dict) -> Optional[dict]:
+    """Снимок поста для публикации: с премиум-эмодзи, а при водяном знаке — любой снимок с файлами."""
+    if data.get("payload"):
+        return data["payload"]
+    return data.get("wm") if postopts.normalize(data.get("options"))["watermark"] else None
+
+
 async def _publish_now(
     bot: Bot, db: Database, user_id: int, data: dict, reader: Optional[Any] = None
 ) -> tuple[list[str], list[str], list[str]]:
     ok: list[str] = []
     errors: list[str] = []
     notes: list[str] = []
+    opts = postopts.normalize(data.get("options"))
+    wm = await db.get_watermark(user_id) if opts["watermark"] else None
     for chat_id in data["selected"]:
         channel = await db.get_channel(user_id, chat_id)
         if channel is None:
@@ -290,7 +316,7 @@ async def _publish_now(
         try:
             await publish_post(
                 bot, chat_id, data["src_chat"], data["src_msg"], data["kind"], data.get("override"), data.get("extra"),
-                data.get("payload"), reader, notes, postopts.normalize(data.get("options")),
+                post_payload(data), reader, notes, opts, wm,
             )
             ok.append(channel["title"])
         except Exception as exc:  # noqa: BLE001
@@ -398,7 +424,7 @@ async def _schedule(
     post_id = await db.add_post(
         user_id, data["src_chat"], data["src_msg"], data["kind"],
         data.get("override"), data["selected"], int(when.timestamp()), data.get("extra"),
-        data.get("payload"), data.get("options"),
+        post_payload(data), data.get("options"),
     )
     titles = {c["chat_id"]: c["title"] for c in await db.list_channels(user_id)}
     names = ", ".join(titles.get(c, str(c)) for c in data["selected"])

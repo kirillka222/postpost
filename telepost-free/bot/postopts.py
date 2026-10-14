@@ -8,7 +8,7 @@ POST_EMOJI_ID = "5361692603727252420"  # премиум-эмодзи загол�
 MAX_PER_ROW = 8
 MAX_ROWS = 15
 COLORS = {"r": "danger", "g": "success", "b": "primary"}  # красная, зелёная, синяя (Bot API 9.4: style)
-FLAGS = ("silent", "pin", "protect", "nocomments")
+FLAGS = ("silent", "pin", "protect", "nocomments", "watermark")
 
 _COLOR = re.compile(r"^!([rgbRGB])\s+")
 _DASH = re.compile(r"\s[-–—]\s")
