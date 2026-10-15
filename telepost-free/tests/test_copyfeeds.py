@@ -25,10 +25,14 @@ class HistoryReader(FakeReader):
     def __init__(self, posts):
         super().__init__(posts)
         self.oldest_calls = []
+        self.top = max(p.last_id for p in posts)
 
     async def fetch_oldest(self, username, after_id, limit=5):
         self.oldest_calls.append((after_id, limit))
-        return [p for p in sorted(self.posts, key=lambda p: p.last_id) if p.last_id > after_id][:limit]
+        # ids без постов (служебные сообщения канала) тоже занимают место в пачке, как у настоящего читателя
+        window = range(after_id + 1, after_id + 1 + limit)
+        got = [p for p in sorted(self.posts, key=lambda p: p.last_id) if p.last_id in window]
+        return got, (after_id + limit if window[-1] <= self.top else self.top)
 
 
 def photo(n):
@@ -95,8 +99,18 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([kw["text"] for c, kw in bot.calls if c == "send" and kw["chat_id"] == -100],
                          [f"пост {i}" for i in range(1, 8)])  # строго по порядку
         self.assertEqual(sleeps.count(5), 7)  # пауза 5 с после каждого поста
-        self.assertEqual([c[0] for c in reader.oldest_calls], [0, 5, 7])
+        self.assertEqual([c[0] for c in reader.oldest_calls], [0, 5, 7])  # после 7 — пусто
         self.assertTrue(any("завершено" in kw.get("text", "") for c, kw in bot.calls if kw["chat_id"] == ADMIN))
+
+    async def test_leading_service_messages_do_not_stall_backfill(self):
+        # первые 7 id — служебные сообщения канала (постов нет), настоящие посты начинаются с id 8
+        await self.db.add_feed(ADMIN, "src", "Источник", 0, [-100], rewrite=False, credit=False, kind="copy")
+        reader = HistoryReader([FetchedPost([8], "первый настоящий"), FetchedPost([9], "второй")])
+        bot = MediaBot()
+        for _ in range(3):
+            await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")
+        self.assertEqual([kw["text"] for c, kw in bot.calls if kw["chat_id"] == -100],
+                         ["первый настоящий", "второй"])
 
     async def test_failed_post_blocks_queue_then_is_skipped(self):
         await self.db.add_feed(ADMIN, "src", "Источник", 0, [-100], rewrite=False, credit=False, kind="copy")

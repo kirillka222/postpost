@@ -141,8 +141,12 @@ class TelethonReader:
         msgs = await self.client.get_messages(ent, limit=1)
         return int(msgs[0].id) if msgs else 0
 
-    async def fetch_oldest(self, username: str, after_id: int, limit: int = 5) -> list[FetchedPost]:
-        """Следующие по порядку посты после after_id: от старых к новым (копирование всей истории канала)."""
+    async def fetch_oldest(self, username: str, after_id: int, limit: int = 5) -> tuple[list[FetchedPost], int]:
+        """Следующие по порядку посты после after_id (от старых к новым) для копирования всей истории канала.
+
+        Возвращает (посты, id последнего просмотренного сообщения). Служебные и пустые сообщения постами не
+        становятся, но курсор через них обязан пройти: иначе пачка из одних «Канал создан» застопорит копирование.
+        """
         ent = await self._entity(username)
         msgs = await self.client.get_messages(ent, offset_id=after_id, reverse=True, limit=limit)
         msgs = sorted(msgs, key=lambda m: m.id)
@@ -156,7 +160,11 @@ class TelethonReader:
             if (now - m.date).total_seconds() < self.settle_seconds:
                 break
             settled.append(m)
-        return await self._convert(settled)
+        posts = await self._convert(settled)
+        scanned = max([after_id, *[m.id for m in settled]])
+        log.info("%s: копирование после id %d — прочитано сообщений %d, постов %d, дошли до id %d",
+                 username if not is_private(username) else "закрытый канал", after_id, len(msgs), len(posts), scanned)
+        return posts, scanned
 
     async def fetch_new(self, username: str, after_id: int) -> list[FetchedPost]:
         ent = await self._entity(username)

@@ -155,11 +155,12 @@ async def process_feed(
     scheduled = state == "go"  # по расписанию: один пост за раз
     consumed = False
     try:
+        scanned = 0
         if copy_mode and hasattr(reader, "fetch_oldest"):  # с первого поста: от старых к новым небольшими пачками
-            fetching = reader.fetch_oldest(username, feed["last_msg_id"], COPY_BATCH)  # type: ignore[attr-defined]
+            posts, scanned = await asyncio.wait_for(
+                reader.fetch_oldest(username, feed["last_msg_id"], COPY_BATCH), FETCH_TIMEOUT)  # type: ignore[attr-defined]
         else:
-            fetching = reader.fetch_new(username, feed["last_msg_id"])
-        posts = await asyncio.wait_for(fetching, FETCH_TIMEOUT)
+            posts = await asyncio.wait_for(reader.fetch_new(username, feed["last_msg_id"]), FETCH_TIMEOUT)
     except Exception as exc:  # noqa: BLE001
         delay = getattr(exc, "seconds", None)  # FloodWait у Telethon
         log.warning("Источник %s не прочитан: %s", label, str(exc) or type(exc).__name__)
@@ -170,6 +171,11 @@ async def process_feed(
         return 0
 
     log.info("Источник %s: новых постов %d (после id %d)", label, len(posts), feed["last_msg_id"])
+    if copy_mode and not posts and scanned > feed["last_msg_id"]:
+        # в пачке были только служебные или пустые сообщения: двигаем курсор дальше и сразу читаем следующую
+        await db.update_feed_last(feed["id"], scanned)
+        _copy_active.add(feed["id"])
+        return 1
     if copy_mode:
         if posts:
             _copy_active.add(feed["id"])
