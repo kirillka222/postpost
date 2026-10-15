@@ -24,6 +24,12 @@ log = logging.getLogger(__name__)
 MAX_BACKLOG = 10
 # Чтение источника (вместе со скачиванием файлов) не должно подвешивать весь цикл навсегда
 FETCH_TIMEOUT = 600.0
+# Админское копирование: все существующие посты от первого к последнему, с паузой между постами
+COPY_DELAY = 5.0
+COPY_BATCH = 5  # постов за одно чтение: файлы лежат в памяти, пачку делаем небольшой
+COPY_MAX_TRIES = 3  # столько раз пробуем недоставляемый пост, потом пропускаем, чтобы очередь не встала навсегда
+_copy_fails: dict[int, tuple[int, int]] = {}  # feed_id → (id поста, неудачных попыток)
+_copy_active: set[int] = set()  # источники, из которых уже копировали в этом запуске (для уведомления о конце)
 
 
 async def deliver(
@@ -141,13 +147,19 @@ async def process_feed(
     now_ts = int(time.time() if now is None else now)
     if not feed["targets"]:
         return 0  # каналы не выбраны: посты не читаем и не теряем, они дождутся выбора
-    state = await _gate(db, reader, feed, now_ts)
+    copy_mode = feed.get("kind") == "copy"
+    # у копирования своя пауза (кнопка в карточке) и своя скорость: расписание и тихие часы на него не действуют
+    state = "free" if copy_mode else await _gate(db, reader, feed, now_ts)
     if state in ("paused", "quiet", "wait"):
         return 0
     scheduled = state == "go"  # по расписанию: один пост за раз
     consumed = False
     try:
-        posts = await asyncio.wait_for(reader.fetch_new(username, feed["last_msg_id"]), FETCH_TIMEOUT)
+        if copy_mode and hasattr(reader, "fetch_oldest"):  # с первого поста: от старых к новым небольшими пачками
+            fetching = reader.fetch_oldest(username, feed["last_msg_id"], COPY_BATCH)  # type: ignore[attr-defined]
+        else:
+            fetching = reader.fetch_new(username, feed["last_msg_id"])
+        posts = await asyncio.wait_for(fetching, FETCH_TIMEOUT)
     except Exception as exc:  # noqa: BLE001
         delay = getattr(exc, "seconds", None)  # FloodWait у Telethon
         log.warning("Источник %s не прочитан: %s", label, str(exc) or type(exc).__name__)
@@ -158,15 +170,24 @@ async def process_feed(
         return 0
 
     log.info("Источник %s: новых постов %d (после id %d)", label, len(posts), feed["last_msg_id"])
-    prefs = await db.get_feed_prefs(owner)
-    copy_mode = feed.get("kind") == "copy"  # админское копирование: текст как есть, без ИИ, подписи и чистки ссылок
     if copy_mode:
+        if posts:
+            _copy_active.add(feed["id"])
+        elif feed["id"] in _copy_active:
+            _copy_active.discard(feed["id"])
+            log.info("Источник %s: все существующие посты скопированы", label)
+            await _safe_dm(bot, owner, f"✅ Копирование из {label} завершено: все существующие посты опубликованы. "
+                                       "Новые посты этого канала тоже будут копироваться; чтобы остановить, "
+                                       "поставьте источник на паузу или удалите его в разделе «Копирование».")
+    prefs = await db.get_feed_prefs(owner)
+    if copy_mode:  # текст как есть: без ИИ, подписи и чистки ссылок
         prefs = {**prefs, "strip_links": False, "footer": "", "footer_entities": []}
     footer_entities = [Entity(**d) for d in prefs["footer_entities"]]
     wm = await db.get_watermark(owner)
     wm_on = wm["feeds"] and watermark.ready(wm)
     delivered = 0
-    for post in posts[-MAX_BACKLOG:]:
+    stopped = False
+    for post in (posts if copy_mode else posts[-MAX_BACKLOG:]):
         text, entities = post.text, post.entities
         if prefs["strip_links"]:
             text, entities = strip_links(text, entities)  # чужие ссылки и @упоминания до ИИ
@@ -238,49 +259,79 @@ async def process_feed(
                         "Проверьте, что бот админ с правом публикации.",
                     )
         await _clear_stage(bot, reader, cfg, stage)
+        if copy_mode and not post_ok:
+            prev = _copy_fails.get(feed["id"])
+            tries = prev[1] + 1 if prev and prev[0] == post.last_id else 1
+            if tries < COPY_MAX_TRIES:  # не двигаем курсор: этот пост повторится в следующий цикл
+                _copy_fails[feed["id"]] = (post.last_id, tries)
+                log.warning("Источник %s: пост %s не опубликован (попытка %d из %d), повторю позже", label,
+                            post.message_ids, tries, COPY_MAX_TRIES)
+                stopped = True
+                break
+            _copy_fails.pop(feed["id"], None)
+            log.warning("Источник %s: пост %s пропущен после %d попыток", label, post.message_ids, tries)
+        elif copy_mode:
+            _copy_fails.pop(feed["id"], None)
         if post_ok:
             await db.bump_published(owner, feed=1)
         # id двигаем всегда: иначе недоставляемый пост будет повторяться бесконечно
         await db.update_feed_last(feed["id"], post.last_id)
         if scheduled:
             break  # один пост за слот расписания, остальные дождутся своей очереди
+        if copy_mode and COPY_DELAY:
+            await asyncio.sleep(COPY_DELAY)  # пауза между постами
 
     if consumed:
         await db.set_feed_sched_last(feed["id"], now_ts)
-    elif posts:
+    elif posts and not copy_mode and not stopped:
         await db.update_feed_last(feed["id"], max(p.last_id for p in posts))
-    return delivered
+    return len(posts) if copy_mode and not stopped else delivered
 
 
 async def run_feeds_once(
     bot: Any, db: Database, cfg: Config, reader: Reader,
-    rewriter: Optional[Rewriter] = None, pause: float = 1.5,
+    rewriter: Optional[Rewriter] = None, pause: float = 1.5, kind: Optional[str] = None,
 ) -> int:
+    """Один проход по источникам. kind: 'feed' — обычные, 'copy' — админское копирование, None — все."""
     rewriter = rewriter or default_rewriter(cfg)
     total = 0
     allowed: dict[int, bool] = {}
     feeds = []
     for f in await db.list_active_feeds():
+        if kind is not None and f.get("kind", "feed") != kind:
+            continue
         owner = f["owner_id"]
         if owner not in allowed:
             allowed[owner] = await feeds_allowed(db, cfg, owner)
         if allowed[owner]:
             feeds.append(f)
-    log.info("Нейропостинг: проверка источников, активных: %d", len(feeds))
+    if kind != "copy" or feeds:
+        log.info("Нейропостинг: проверка источников%s, активных: %d", " (копирование)" if kind == "copy" else "",
+                 len(feeds))
     for feed in feeds:
         total += await process_feed(bot, db, reader, feed, rewriter, cfg)
-        if pause:
+        if pause and feed.get("kind") != "copy":
             await asyncio.sleep(pause)  # не частим к Telegram
     return total
 
 
-async def feed_loop(bot: Any, db: Database, cfg: Config, reader: Reader) -> None:
-    log.info("Нейропостинг запущен: опрос каждые %d с", max(cfg.feed_poll_seconds, 30))
+async def _loop(bot: Any, db: Database, cfg: Config, reader: Reader, kind: str, idle: float) -> None:
     while True:
+        busy = 0
         try:
-            await run_feeds_once(bot, db, cfg, reader)
+            busy = await run_feeds_once(bot, db, cfg, reader, kind=kind)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            log.exception("Ошибка цикла нейропостинга")
-        await asyncio.sleep(max(cfg.feed_poll_seconds, 30))
+            log.exception("Ошибка цикла нейропостинга (%s)", kind)
+        # копирование с остатком постов продолжается сразу: паузу между постами уже выдержал process_feed
+        await asyncio.sleep(0.5 if (kind == "copy" and busy) else idle)
+
+
+async def feed_loop(bot: Any, db: Database, cfg: Config, reader: Reader) -> None:
+    log.info("Нейропостинг запущен: опрос каждые %d с", max(cfg.feed_poll_seconds, 30))
+    # копирование идёт отдельной задачей: долгая выкладка истории канала не задерживает обычные источники
+    await asyncio.gather(
+        _loop(bot, db, cfg, reader, "feed", max(cfg.feed_poll_seconds, 30)),
+        _loop(bot, db, cfg, reader, "copy", 30),
+    )

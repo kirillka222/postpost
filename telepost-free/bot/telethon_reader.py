@@ -72,6 +72,14 @@ class TelethonReader:
             raise SourceError("Это не пригласительная ссылка.")
         await self._invite_entity(key[1:])
 
+    async def is_member(self, chat_id: int) -> bool:
+        """Аккаунт уже состоит в канале (тогда вступать по ссылке не нужно)."""
+        try:
+            await self.client.get_permissions(await self._peer(chat_id), "me")
+            return True
+        except Exception:  # noqa: BLE001 — не участник, канал не найден и т.п.
+            return False
+
     async def stop(self) -> None:
         await self.client.disconnect()
 
@@ -133,6 +141,23 @@ class TelethonReader:
         msgs = await self.client.get_messages(ent, limit=1)
         return int(msgs[0].id) if msgs else 0
 
+    async def fetch_oldest(self, username: str, after_id: int, limit: int = 5) -> list[FetchedPost]:
+        """Следующие по порядку посты после after_id: от старых к новым (копирование всей истории канала)."""
+        ent = await self._entity(username)
+        msgs = await self.client.get_messages(ent, offset_id=after_id, reverse=True, limit=limit)
+        msgs = sorted(msgs, key=lambda m: m.id)
+        if len(msgs) >= limit and getattr(msgs[-1], "grouped_id", None) is not None:
+            gid = msgs[-1].grouped_id  # альбом оборвался на границе пачки: заберём его целиком в следующий раз
+            while msgs and getattr(msgs[-1], "grouped_id", None) == gid:
+                msgs.pop()
+        now = self._now()
+        settled = []
+        for m in msgs:
+            if (now - m.date).total_seconds() < self.settle_seconds:
+                break
+            settled.append(m)
+        return await self._convert(settled)
+
     async def fetch_new(self, username: str, after_id: int) -> list[FetchedPost]:
         ent = await self._entity(username)
         msgs = await self.client.get_messages(ent, min_id=after_id, limit=FETCH_LIMIT)
@@ -173,7 +198,8 @@ class TelethonReader:
                      (f.size or 0) // 2**20, MAX_MEDIA_BYTES // 2**20)
             name = getattr(f, "name", None) or (
                 f"{kind}{f.ext}" if getattr(f, "ext", None) else _DEFAULT_NAME[kind])
-            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None), big=True)
+            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None), big=True,
+                             size=int(f.size or 0))
             if kind == "video":
                 item.duration = int(getattr(f, "duration", 0) or 0)
                 item.width = int(getattr(f, "width", 0) or 0)
@@ -264,13 +290,21 @@ class TelethonReader:
             if not name:
                 ext = getattr(f, "ext", None) if f is not None else None
                 name = f"{kind}{ext}" if ext else _DEFAULT_NAME[kind]
-            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None))
+            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None),
+                             size=int(getattr(f, "size", 0) or 0))
             if kind == "video" and f is not None:
                 item.duration = int(getattr(f, "duration", 0) or 0)
                 item.width = int(getattr(f, "width", 0) or 0)
                 item.height = int(getattr(f, "height", 0) or 0)
             items.append(item)
         return items
+
+    async def download_item(self, item: MediaItem) -> bytes:
+        """Скачивает файл любого размера от имени аккаунта (бот ограничен 20 МБ): нужно для водяного знака."""
+        data = await self.client.download_media(item.source, file=bytes)
+        if not data:
+            raise SourceError("файл не скачался")
+        return bytes(data)
 
     async def delete(self, chat_id: int, message_ids: list[int]) -> None:
         """Удаляет сообщения аккаунта (чистка служебного канала после копирования)."""

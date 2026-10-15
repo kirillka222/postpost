@@ -1,8 +1,9 @@
 """/copy — админское копирование: бот берёт новые посты из канала-источника и публикует их в ваши каналы.
 
-Отличия от обычного нейропостинга: доступно только администраторам бота; текст копируется как есть (без ИИ,
+Отличия от обычного нейропостинга: доступно только администраторам бота; бот копирует ВСЕ существующие посты
+канала от первого к последнему с паузой 5 секунд, а потом продолжает новые; текст копируется как есть (без ИИ,
 подписи, ссылки на источник и чистки ссылок); если в посте больше одного фото/видео, последнее отбрасывается
-(пост на 3 картинки выходит с первыми двумя). Расписание, пауза и водяной знак общие с нейропостингом.
+(пост на 3 картинки выходит с первыми двумя). Расписание нейропостинга на копирование не действует, водяной знак общий.
 """
 from __future__ import annotations
 
@@ -48,8 +49,9 @@ router.callback_query.filter(is_admin)
 def main_view(feeds: list[dict], titles: dict[int, str]) -> tuple[str, Any]:
     text = (
         "📋 Копирование (для админов)\n\n"
-        "Бот берёт новые посты из канала-источника и публикует их в ваши каналы: текст как есть, без ИИ и "
-        "подписи. Если в посте несколько фото/видео, последнее отбрасывается: из 3 картинок выйдут первые две.\n\n"
+        "Бот копирует ВСЕ существующие посты канала-источника в ваши каналы по порядку, от первого к последнему, "
+        "с паузой 5 секунд между постами, а потом продолжает копировать новые. Текст как есть, без ИИ и подписи. "
+        "Если в посте несколько фото/видео, последнее отбрасывается: из 3 картинок выйдут первые две.\n\n"
         f"📥 Источников: {len(feeds)}   📤 Каналов: {len(titles)}"
     )
     if not titles:
@@ -64,7 +66,7 @@ def card_view(feed: dict, titles: dict[int, str]) -> tuple[str, Any]:
     names = [titles.get(t, str(t)) for t in feed["targets"]]
     where = f"{len(names)} каналов" if len(names) > 3 else (", ".join(names) or "—")
     text = (f"📥 {source_label(feed['username'], feed['title'])}\n→ {where}\n\n"
-            f"Копирование без ИИ · {'работает' if feed['active'] else 'на паузе'}")
+            f"Копирование без ИИ, с первого поста, пауза 5 с · {'работает' if feed['active'] else 'на паузе'}")
     if not feed["targets"]:
         text += "\n\n⚠️ Каналы не выбраны: посты не публикуются."
     fid = feed["id"]
@@ -268,7 +270,8 @@ async def got_username(message: Message, state: FSMContext, db: Database, reader
     await state.set_data({"username": username, "title": info.title, "targets": chosen})
     await message.answer(
         f"Источник: «{info.title}» ({'закрытый канал' if is_private(username) else source_label(username, info.title)})."
-        "\nКуда публиковать его новые посты? Отметьте каналы и нажмите «Готово».",
+        "\nБот скопирует все его посты от первого до последнего (пауза 5 секунд), затем продолжит новые.\n"
+        "Куда публиковать? Отметьте каналы и нажмите «Готово».",
         reply_markup=new_targets_kb(channels, chosen))
 
 
@@ -300,8 +303,8 @@ async def new_targets(cb: CallbackQuery, state: FSMContext, db: Database, reader
             await cb.answer()
             return
         try:
-            last_id = await reader.latest_id(data["username"])  # старые посты не копируем
-            fid = await db.add_feed(uid, data["username"], data["title"], last_id, data["targets"],
+            # с нуля: копируется вся история канала от первого поста; чтобы стартовать с новых, нужен id последнего
+            fid = await db.add_feed(uid, data["username"], data["title"], 0, data["targets"],
                                     rewrite=False, credit=False, kind="copy")
         except (SourceError, ValueError) as exc:
             await cb.answer(str(exc), show_alert=True)

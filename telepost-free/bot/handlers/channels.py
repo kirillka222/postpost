@@ -297,6 +297,11 @@ def rights_text(missing: list[str], bot_name: str = "") -> str:
     )
 
 
+def _invite_expired(exc: Exception) -> bool:
+    """Telegram сообщил, что пригласительная ссылка истекла или отозвана."""
+    return type(exc).__name__.startswith("InviteHash") or "has expired" in str(exc).lower()
+
+
 async def ensure_publisher(bot: Bot, reader: Any, chat_id: int) -> tuple[str, str]:
     """Делает Premium-аккаунт админом канала (только публикация). Возвращает (статус, текст для пользователя).
 
@@ -323,8 +328,24 @@ async def ensure_publisher(bot: Bot, reader: Any, chat_id: int) -> tuple[str, st
         return "no_rights", rights_text(missing, await bot_mention(bot))
     link = None
     try:
-        link = await bot.create_chat_invite_link(chat_id, name="premium-emoji", member_limit=1)
-        await reader.join_invite(link.invite_link)
+        is_member = getattr(reader, "is_member", None)
+        if not (is_member is not None and await is_member(chat_id)):  # уже в канале: вступать не нужно
+            for attempt in (0, 1):
+                # вторая попытка — свежая ссылка без лимита: одноразовая могла «сгореть» при прошлой попытке
+                link = await bot.create_chat_invite_link(
+                    chat_id, name="premium-emoji", member_limit=1 if attempt == 0 else None)
+                try:
+                    await reader.join_invite(link.invite_link)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == 0 and _invite_expired(exc):
+                        try:
+                            await bot.revoke_chat_invite_link(chat_id, link.invite_link)
+                        except TelegramAPIError:
+                            pass
+                        link = None
+                        continue
+                    raise
         # can_restrict_members=False обязательно: для каналов Bot API сам включает «Блокировку пользователей»,
         # если параметр не передан, а у бота этого права может не быть (тогда RIGHT_FORBIDDEN)
         await bot.promote_chat_member(chat_id, reader.me_id, can_post_messages=True, can_restrict_members=False)
@@ -342,6 +363,11 @@ async def ensure_publisher(bot: Bot, reader: Any, chat_id: int) -> tuple[str, st
     except Exception as exc:  # noqa: BLE001
         if getattr(exc, "seconds", None) is not None:
             return "error", "⏳ Telegram временно ограничил вступления аккаунта. Повторите позже."
+        if _invite_expired(exc):
+            return "error", (
+                "❌ Telegram сразу счёл пригласительную ссылку недействительной (истекла или отозвана). Повторите "
+                "через минуту. Если повторяется: проверьте, что Premium-аккаунт не в списке удалённых/заблокированных "
+                "канала, или добавьте его в канал вручную администратором с правом «Публикация сообщений».")
         return "error", f"❌ Не удалось подключить аккаунт: {exc}"
     finally:
         if link is not None:

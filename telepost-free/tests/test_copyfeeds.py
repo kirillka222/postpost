@@ -19,6 +19,18 @@ from tests.test_handlers_flow import FakeCb, FakeMsg, FakeState  # noqa: E402
 ADMIN = 1
 
 
+class HistoryReader(FakeReader):
+    """Канал с историей: fetch_oldest отдаёт следующие посты по порядку, как настоящий читатель."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.oldest_calls = []
+
+    async def fetch_oldest(self, username, after_id, limit=5):
+        self.oldest_calls.append((after_id, limit))
+        return [p for p in sorted(self.posts, key=lambda p: p.last_id) if p.last_id > after_id][:limit]
+
+
 def photo(n):
     return MediaItem("photo", f"p{n}".encode(), f"{n}.jpg")
 
@@ -43,6 +55,10 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.db.ensure_user(ADMIN, "UTC")
         await self.db.set_footer(ADMIN, "ПОДПИСЬ", [])
         self.rewrites = []
+        self.old_delay = feed_engine.COPY_DELAY
+        feed_engine.COPY_DELAY = 0
+        feed_engine._copy_fails.clear()
+        feed_engine._copy_active.clear()
 
         async def rewriter(text, style):
             self.rewrites.append(text)
@@ -51,7 +67,64 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.rewriter = rewriter
 
     async def asyncTearDown(self):
+        feed_engine.COPY_DELAY = self.old_delay
         await self.db.close()
+
+    async def test_backfill_from_first_to_last_in_batches_with_delay(self):
+        await self.db.add_feed(ADMIN, "src", "Источник", 0, [-100], rewrite=False, credit=False, kind="copy")
+        reader = HistoryReader([FetchedPost([i], f"пост {i}") for i in range(1, 8)])
+        sleeps = []
+        real_sleep = feed_engine.asyncio.sleep
+
+        async def fake_sleep(delay, *a):
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        feed_engine.COPY_DELAY = 5
+        feed_engine.asyncio.sleep = fake_sleep
+        try:
+            bot = MediaBot()
+            n1 = await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")
+            self.assertEqual(n1, feed_engine.COPY_BATCH)  # «ещё есть работа»
+            n2 = await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")
+            n3 = await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")
+        finally:
+            feed_engine.asyncio.sleep = real_sleep
+        self.assertEqual(n2, 2)
+        self.assertEqual(n3, 0)
+        self.assertEqual([kw["text"] for c, kw in bot.calls if c == "send" and kw["chat_id"] == -100],
+                         [f"пост {i}" for i in range(1, 8)])  # строго по порядку
+        self.assertEqual(sleeps.count(5), 7)  # пауза 5 с после каждого поста
+        self.assertEqual([c[0] for c in reader.oldest_calls], [0, 5, 7])
+        self.assertTrue(any("завершено" in kw.get("text", "") for c, kw in bot.calls if kw["chat_id"] == ADMIN))
+
+    async def test_failed_post_blocks_queue_then_is_skipped(self):
+        await self.db.add_feed(ADMIN, "src", "Источник", 0, [-100], rewrite=False, credit=False, kind="copy")
+        reader = HistoryReader([FetchedPost([1], "первый"), FetchedPost([2], "второй")])
+
+        class Broken(MediaBot):
+            async def send_message(self, **kw):
+                if kw["chat_id"] == -100 and kw["text"] == "первый":
+                    raise RuntimeError("Forbidden")
+                return await super().send_message(**kw)
+
+        bot = Broken()
+        for _ in range(2):
+            await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")
+            self.assertEqual((await self.db.list_feeds(ADMIN, "copy"))[0]["last_msg_id"], 0)  # курсор стоит
+        self.assertEqual([c for c in bot.calls if c[1].get("chat_id") == -100 and c[1].get("text") == "второй"], [])
+        await feed_engine.run_feeds_once(bot, self.db, self.cfg, reader, self.rewriter, kind="copy")  # 3-я попытка
+        self.assertEqual((await self.db.list_feeds(ADMIN, "copy"))[0]["last_msg_id"], 2)  # первый пропущен, второй вышел
+        self.assertTrue(any(kw.get("text") == "второй" for c, kw in bot.calls if kw["chat_id"] == -100))
+
+    async def test_schedule_and_pause_do_not_apply(self):
+        await self.db.add_feed(ADMIN, "src", "Источник", 0, [-100], rewrite=False, credit=False, kind="copy")
+        await self.db.set_feed_schedule(ADMIN, mode="interval", every=360, paused_until=feed_engine.schedule.FOREVER)
+        bot = MediaBot()
+        await feed_engine.run_feeds_once(bot, self.db, self.cfg, HistoryReader([FetchedPost([1], "а"),
+                                                                                 FetchedPost([2], "б")]),
+                                         self.rewriter, kind="copy")
+        self.assertEqual(len([c for c in bot.calls if c[1].get("chat_id") == -100]), 2)
 
     async def run_once(self, post):
         bot = MediaBot()
@@ -96,7 +169,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.db.ensure_user(ADMIN, "UTC")
         await self.db.add_channel(ADMIN, -100, "Первый", "")
         await self.db.add_channel(ADMIN, -200, "Второй", "")
-        self.reader = FakeReader(latest=42)
+        self.reader = FakeReader(latest=42)  # история копируется с нуля, а не с последнего поста
 
     async def asyncTearDown(self):
         await self.db.close()
@@ -120,7 +193,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await copyfeeds.new_targets(FakeCb("cp:nd", user_id=ADMIN), state, self.db, self.reader)
         feed = (await self.db.list_feeds(ADMIN, "copy"))[0]
         self.assertEqual((feed["username"], feed["last_msg_id"], feed["rewrite"], feed["credit"], feed["targets"]),
-                         ("chan", 42, False, False, [-200, -100]))
+                         ("chan", 0, False, False, [-200, -100]))
         fid = feed["id"]
         await copyfeeds.cb_target_change(FakeCb(f"cp:tt:{fid}:-100:0", user_id=ADMIN), self.db)
         self.assertEqual((await self.db.get_feed(ADMIN, fid, "copy"))["targets"], [-200])
