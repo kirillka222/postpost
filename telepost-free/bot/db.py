@@ -129,6 +129,9 @@ class Database:
             ):
                 if name not in ucols:  # данные для админки
                     conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+            if "clean" not in {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}:
+                # настройки удаления чужого водяного знака в копировании (JSON, пусто — выключено)
+                conn.execute("ALTER TABLE feeds ADD COLUMN clean TEXT NOT NULL DEFAULT ''")
             if "kind" not in {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}:
                 # 'feed' — обычный нейропостинг, 'copy' — админское копирование без ИИ
                 conn.execute("ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'feed'")
@@ -546,6 +549,7 @@ class Database:
             d = dict(r)
             for k in ("rewrite", "credit", "active"):
                 d[k] = bool(d[k])
+            d["clean"] = json.loads(d["clean"]) if d.get("clean") else None
             d["targets"] = [
                 t["chat_id"]
                 for t in c.execute(
@@ -671,6 +675,14 @@ class Database:
                 c, c.execute("SELECT * FROM feeds WHERE owner_id=? AND kind=? ORDER BY id",
                              (owner_id, kind)).fetchall()
             )
+        )
+
+    async def set_feed_clean(self, owner_id: int, feed_id: int, clean: Optional[dict]) -> bool:
+        """Настройки удаления чужого знака у источника копирования (None — выключить)."""
+        raw = json.dumps(clean, ensure_ascii=False) if clean else ""
+        return await self._run(
+            lambda c: c.execute("UPDATE feeds SET clean=? WHERE id=? AND owner_id=?", (raw, feed_id, owner_id)).rowcount
+            > 0
         )
 
     async def get_feed(self, owner_id: int, feed_id: int, kind: str = "feed") -> Optional[dict]:

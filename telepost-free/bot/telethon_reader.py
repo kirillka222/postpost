@@ -148,12 +148,14 @@ class TelethonReader:
         становятся, но курсор через них обязан пройти: иначе пачка из одних «Канал создан» застопорит копирование.
         """
         ent = await self._entity(username)
-        msgs = await self.client.get_messages(ent, offset_id=after_id, reverse=True, limit=limit)
+        # берём с запасом на самый длинный альбом: пачка из одного большого альбома не должна выглядеть как «пусто»
+        msgs = await self.client.get_messages(ent, offset_id=after_id, reverse=True, limit=limit + MAX_ALBUM)
         msgs = sorted(msgs, key=lambda m: m.id)
-        if len(msgs) >= limit and getattr(msgs[-1], "grouped_id", None) is not None:
-            gid = msgs[-1].grouped_id  # альбом оборвался на границе пачки: заберём его целиком в следующий раз
-            while msgs and getattr(msgs[-1], "grouped_id", None) == gid:
-                msgs.pop()
+        cut = min(limit, len(msgs))
+        while 0 < cut < len(msgs) and getattr(msgs[cut - 1], "grouped_id", None) is not None \
+                and getattr(msgs[cut], "grouped_id", None) == msgs[cut - 1].grouped_id:
+            cut += 1  # альбом на границе пачки забираем целиком
+        msgs = msgs[:cut]
         now = self._now()
         settled = []
         for m in msgs:
@@ -198,6 +200,16 @@ class TelethonReader:
             return "document"
         return None
 
+    @staticmethod
+    def _plain(media: Any) -> Any:
+        """Медиа без спойлера: копия объекта Telethon с выключенным флагом (иначе фото уйдёт закрытым)."""
+        if getattr(media, "spoiler", False):
+            import copy
+
+            media = copy.copy(media)
+            media.spoiler = False
+        return media
+
     async def _download(self, m: Any, kind: str) -> Optional[MediaItem]:
         f = getattr(m, "file", None)
         if f is not None and (getattr(f, "size", 0) or 0) > MAX_MEDIA_BYTES:
@@ -206,7 +218,7 @@ class TelethonReader:
                      (f.size or 0) // 2**20, MAX_MEDIA_BYTES // 2**20)
             name = getattr(f, "name", None) or (
                 f"{kind}{f.ext}" if getattr(f, "ext", None) else _DEFAULT_NAME[kind])
-            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None), big=True,
+            item = MediaItem(kind=kind, data=b"", filename=name, source=self._plain(getattr(m, "media", None)), big=True,
                              size=int(f.size or 0))
             if kind == "video":
                 item.duration = int(getattr(f, "duration", 0) or 0)
@@ -227,7 +239,7 @@ class TelethonReader:
         if not name:
             ext = getattr(f, "ext", None) if f is not None else None
             name = f"{kind}{ext}" if ext else _DEFAULT_NAME[kind]
-        item = MediaItem(kind=kind, data=bytes(data), filename=name, source=getattr(m, "media", None))
+        item = MediaItem(kind=kind, data=bytes(data), filename=name, source=self._plain(getattr(m, "media", None)))
         if kind == "video" and f is not None:
             item.duration = int(getattr(f, "duration", 0) or 0)
             item.width = int(getattr(f, "width", 0) or 0)
@@ -257,6 +269,7 @@ class TelethonReader:
             text_msg = next((m for m in group if getattr(m, "message", None)), None)
             text = (text_msg.message if text_msg is not None else "") or ""
             entities = from_telethon(getattr(text_msg, "entities", None)) if text_msg is not None else []
+            entities = [e for e in entities if e.type != "spoiler"]  # текст под спойлером публикуем открытым
             media: list[MediaItem] = []
             for m in group:
                 kind = self._kind(m)
@@ -298,7 +311,7 @@ class TelethonReader:
             if not name:
                 ext = getattr(f, "ext", None) if f is not None else None
                 name = f"{kind}{ext}" if ext else _DEFAULT_NAME[kind]
-            item = MediaItem(kind=kind, data=b"", filename=name, source=getattr(m, "media", None),
+            item = MediaItem(kind=kind, data=b"", filename=name, source=self._plain(getattr(m, "media", None)),
                              size=int(getattr(f, "size", 0) or 0))
             if kind == "video" and f is not None:
                 item.duration = int(getattr(f, "duration", 0) or 0)

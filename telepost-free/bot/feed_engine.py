@@ -180,6 +180,14 @@ async def process_feed(
         if posts:
             _copy_active.add(feed["id"])
         elif feed["id"] in _copy_active:
+            try:  # «конец» — только если курсор правда дошёл до последнего сообщения канала
+                latest = await reader.latest_id(username)
+            except Exception:  # noqa: BLE001
+                latest = 0
+            if latest > feed["last_msg_id"] and scanned <= feed["last_msg_id"]:
+                log.warning("Источник %s: чтение остановилось на id %d, а в канале есть id %d: пробую снова", label,
+                            feed["last_msg_id"], latest)
+                return 0
             _copy_active.discard(feed["id"])
             log.info("Источник %s: все существующие посты скопированы", label)
             await _safe_dm(bot, owner, f"✅ Копирование из {label} завершено: все существующие посты опубликованы. "
@@ -231,14 +239,16 @@ async def process_feed(
                 log.info("Источник %s: в посте %s несколько фото/видео, последнее отброшено", label,
                          post.message_ids)
                 post = replace(post, media=trimmed)
-        if wm_on and any(m.kind in ("photo", "video") for m in post.media):
+        clean = feed.get("clean") if copy_mode else None  # убрать чужой водяной знак (только копирование)
+        if (wm_on or clean) and any(m.kind in ("photo", "video") for m in post.media):
             try:
-                post = replace(post, media=await watermark.apply_items(post.media, wm, getattr(reader, "download_item", None)))
-            except Exception as exc:  # noqa: BLE001 — пост без знака не публикуем
-                log.warning("Источник %s: водяной знак на посте %s не нанесён: %s", label, post.message_ids, exc)
+                post = replace(post, media=await watermark.apply_items(
+                    post.media, wm if wm_on else None, getattr(reader, "download_item", None), remove=clean))
+            except Exception as exc:  # noqa: BLE001 — пост с нетронутым чужим знаком или без нашего не публикуем
+                log.warning("Источник %s: фото/видео поста %s не обработаны: %s", label, post.message_ids, exc)
                 if _should_notify("wm", feed["id"], time.time()):
-                    await _safe_dm(bot, owner, f"⚠️ Пост из {label} пропущен: не удалось наложить водяной знак "
-                                               f"({exc}). Отключить знак для нейропостинга: /watermark")
+                    await _safe_dm(bot, owner, f"⚠️ Пост из {label} пропущен: не удалось обработать фото/видео "
+                                               f"(водяной знак или удаление чужого знака): {exc}")
                 await db.update_feed_last(feed["id"], post.last_id)
                 consumed = scheduled
                 if scheduled:

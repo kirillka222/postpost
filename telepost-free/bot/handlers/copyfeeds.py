@@ -14,8 +14,9 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from .. import watermark as wm
 from ..config import Config
 from ..db import Database
 from ..feeds import Reader, SourceError, feed_key, is_private, normalize_username, source_label
@@ -66,12 +67,14 @@ def card_view(feed: dict, titles: dict[int, str]) -> tuple[str, Any]:
     names = [titles.get(t, str(t)) for t in feed["targets"]]
     where = f"{len(names)} каналов" if len(names) > 3 else (", ".join(names) or "—")
     text = (f"📥 {source_label(feed['username'], feed['title'])}\n→ {where}\n\n"
-            f"Копирование без ИИ, с первого поста, пауза 5 с · {'работает' if feed['active'] else 'на паузе'}")
+            f"Копирование без ИИ, с первого поста, пауза 5 с · {'работает' if feed['active'] else 'на паузе'}\n"
+            "Спойлеры снимаются: фото, видео и текст приходят открытыми.")
     if not feed["targets"]:
         text += "\n\n⚠️ Каналы не выбраны: посты не публикуются."
     fid = feed["id"]
     rows = [
         [btn(f"📤 Каналы: {len(feed['targets'])} из {len(titles)}", f"cp:tg:{fid}:0")],
+        [btn("🧽 Чужой знак на фото/видео: " + ("убираю" if feed.get("clean") else "не трогаю"), f"cp:cl:{fid}:open")],
         [btn("⏸ Пауза" if feed["active"] else "▶️ Включить", f"cp:act:{fid}"), btn("🗑 Удалить", f"cp:del:{fid}")],
         [btn("◀️ К списку", "cp:home")],
     ]
@@ -91,6 +94,35 @@ def targets_view(feed: dict, channels: list[dict], page: int = 0) -> tuple[str, 
     rows.append([btn("❌ Снять все каналы" if everyone else "✅ Выбрать все каналы", f"cp:ta:{fid}:{page}")])
     rows.append([btn("◀️ Готово", f"cp:s:{fid}")])
     return f"📤 Куда публиковать {source_label(feed['username'], feed['title'])}\nОтметьте каналы.", kb(rows)
+
+
+def clean_view(feed: dict) -> tuple[str, Any]:
+    """Экран «убрать чужой водяной знак» (чистая функция)."""
+    c = feed.get("clean")
+    fid = feed["id"]
+    on = c is not None
+    c = wm.normalize_clean(c)
+    mode = wm.CLEAN_MODES[c["mode"]]
+    text = (
+        "🧽 Чужой водяной знак\n\n"
+        + (f"Убираю: {wm.POSITION_NAMES[c['pos']]}, область {c['w']}% × {c['h']}% кадра, способ — {mode}.\n"
+           if on else "Сейчас не убираю: фото и видео копируются как есть.\n")
+        + "\nУкажите, где у источника стоит знак, и размер области. «Замазать» размывает область, «Обрезать» "
+          "отрезает полосу у края кадра (для знака по центру только замазывание). «Показать пример» рисует тестовый "
+          "кадр с «чужим знаком» и результат."
+    )
+    rows = [[btn("✅ Убираю: выключить" if on else "❌ Не убираю: включить", f"cp:cl:{fid}:on")]]
+    order = ("tl", "tc", "tr", "ml", "c", "mr", "bl", "bc", "br")
+    for i in range(0, 9, 3):
+        rows.append([btn(("• " if c["pos"] == p else "") + wm.POSITIONS[p][0], f"cp:cl:{fid}:pos:{p}")
+                     for p in order[i:i + 3]])
+    rows.append([btn("➖", f"cp:cl:{fid}:w:-"), btn(f"Ширина {c['w']}%", f"cp:cl:{fid}:noop"),
+                 btn("➕", f"cp:cl:{fid}:w:+")])
+    rows.append([btn("➖", f"cp:cl:{fid}:h:-"), btn(f"Высота {c['h']}%", f"cp:cl:{fid}:noop"),
+                 btn("➕", f"cp:cl:{fid}:h:+")])
+    rows.append([btn(f"Способ: {mode}", f"cp:cl:{fid}:mode"), btn("🖼 Пример", f"cp:cl:{fid}:demo")])
+    rows.append([btn("◀️ Назад", f"cp:s:{fid}")])
+    return text, kb(rows)
 
 
 def new_targets_kb(channels: list[dict], chosen: list[int]) -> Any:
@@ -220,6 +252,44 @@ async def cb_target_change(cb: CallbackQuery, db: Database) -> None:
         page = int(parts[3])
     feed = await db.get_feed(uid, fid, "copy")
     text, markup = targets_view(feed, channels, page)  # type: ignore[arg-type]
+    await _edit(cb.message, text, markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cp:cl:"))
+async def cb_clean(cb: CallbackQuery, db: Database) -> None:
+    uid, parts = cb.from_user.id, cb.data.split(":")
+    fid, action, arg = int(parts[2]), parts[3], (parts[4] if len(parts) > 4 else "")
+    feed = await db.get_feed(uid, fid, "copy")
+    if feed is None:
+        await cb.answer("Источник не найден", show_alert=True)
+        return
+    cur = feed.get("clean")
+    c = wm.normalize_clean(cur)
+    if action == "demo":
+        await cb.answer()
+        try:
+            await cb.message.answer_photo(BufferedInputFile(wm.clean_sample(c), filename="example.jpg"),
+                                          caption="Так выглядит результат: на тестовом кадре был «чужой знак» в выбранном месте")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Пример очистки не построен: %s", exc)
+            await cb.message.answer(f"❌ Не удалось построить пример: {exc}")
+        return
+    if action == "on":
+        await db.set_feed_clean(uid, fid, None if cur is not None else c)
+    elif action in ("pos", "w", "h", "mode") or action == "noop":
+        if action == "pos" and arg in wm.POSITIONS:
+            c["pos"] = arg
+        elif action == "w" and arg in ("+", "-"):
+            c["w"] = wm.step(c["w"], wm.CLEAN_STEP if arg == "+" else -wm.CLEAN_STEP, wm.CLEAN_W)
+        elif action == "h" and arg in ("+", "-"):
+            c["h"] = wm.step(c["h"], wm.CLEAN_STEP if arg == "+" else -wm.CLEAN_STEP, wm.CLEAN_H)
+        elif action == "mode":
+            c["mode"] = "crop" if c["mode"] == "blur" else "blur"
+        if action != "noop":
+            await db.set_feed_clean(uid, fid, c)  # любая настройка сразу включает удаление
+    feed = await db.get_feed(uid, fid, "copy")
+    text, markup = clean_view(feed)  # type: ignore[arg-type]
     await _edit(cb.message, text, markup)
     await cb.answer()
 
