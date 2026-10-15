@@ -129,6 +129,9 @@ class Database:
             ):
                 if name not in ucols:  # данные для админки
                     conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+            if "kind" not in {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}:
+                # 'feed' — обычный нейропостинг, 'copy' — админское копирование без ИИ
+                conn.execute("ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'feed'")
             if "sched_last" not in {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}:
                 # когда источник последний раз публиковал по расписанию
                 conn.execute("ALTER TABLE feeds ADD COLUMN sched_last INTEGER NOT NULL DEFAULT 0")
@@ -554,7 +557,7 @@ class Database:
 
     async def add_feed(
         self, owner_id: int, username: str, title: str, last_msg_id: int, targets: list[int],
-        rewrite: bool = True, style: str = "normal", credit: bool = True,
+        rewrite: bool = True, style: str = "normal", credit: bool = True, kind: str = "feed",
     ) -> int:
         targets = list(dict.fromkeys(targets))
         if not targets:
@@ -564,9 +567,9 @@ class Database:
         def fn(c: sqlite3.Connection) -> int:
             try:
                 cur = c.execute(
-                    "INSERT INTO feeds(owner_id, username, title, last_msg_id, rewrite, style, credit) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (owner_id, username, title, last_msg_id, int(rewrite), style, int(credit)),
+                    "INSERT INTO feeds(owner_id, username, title, last_msg_id, rewrite, style, credit, kind) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (owner_id, username, title, last_msg_id, int(rewrite), style, int(credit), kind),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("Этот источник уже добавлен") from exc
@@ -661,12 +664,23 @@ class Database:
     async def set_feed_sched_last(self, feed_id: int, ts: int) -> None:
         await self._run(lambda c: c.execute("UPDATE feeds SET sched_last=? WHERE id=?", (ts, feed_id)))
 
-    async def list_feeds(self, owner_id: int) -> list[dict]:
+    async def list_feeds(self, owner_id: int, kind: str = "feed") -> list[dict]:
+        """Источники владельца: обычного нейропостинга ('feed') или админского копирования ('copy')."""
         return await self._run(
             lambda c: self._feeds_with_targets(
-                c, c.execute("SELECT * FROM feeds WHERE owner_id=? ORDER BY id", (owner_id,)).fetchall()
+                c, c.execute("SELECT * FROM feeds WHERE owner_id=? AND kind=? ORDER BY id",
+                             (owner_id, kind)).fetchall()
             )
         )
+
+    async def get_feed(self, owner_id: int, feed_id: int, kind: str = "feed") -> Optional[dict]:
+        rows = await self._run(
+            lambda c: self._feeds_with_targets(
+                c, c.execute("SELECT * FROM feeds WHERE owner_id=? AND id=? AND kind=?",
+                             (owner_id, feed_id, kind)).fetchall()
+            )
+        )
+        return rows[0] if rows else None
 
     async def list_active_feeds(self) -> list[dict]:
         return await self._run(
@@ -680,7 +694,7 @@ class Database:
 
     async def count_feeds(self, owner_id: int) -> int:
         return await self._run(
-            lambda c: c.execute("SELECT COUNT(*) FROM feeds WHERE owner_id=?", (owner_id,)).fetchone()[0]
+            lambda c: c.execute("SELECT COUNT(*) FROM feeds WHERE owner_id=? AND kind='feed'", (owner_id,)).fetchone()[0]
         )
 
     async def update_feed_last(self, feed_id: int, last_msg_id: int) -> None:

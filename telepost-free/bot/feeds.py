@@ -31,6 +31,17 @@ class MediaItem:
     source: Any = field(default=None, repr=False, compare=False)
     # Файл больше лимита бота: не скачан (data пуст), уйти может только через аккаунт по ссылке
     big: bool = False
+    size: int = 0  # размер файла в байтах (известен у файлов, которые не скачаны)
+    # Файл был больше лимита бота и скачан аккаунтом (водяной знак): публиковать тоже только аккаунту
+    force_account: bool = False
+
+
+def drop_last_visual(media: list[MediaItem]) -> list[MediaItem]:
+    """Если в посте больше одного фото/видео, последнее убирается (3 картинки → первые две)."""
+    visual = [i for i, m in enumerate(media) if m.kind in ("photo", "video")]
+    if len(visual) < 2:
+        return list(media)
+    return [m for i, m in enumerate(media) if i != visual[-1]]
 
 
 @dataclass

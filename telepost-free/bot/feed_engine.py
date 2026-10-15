@@ -14,7 +14,7 @@ from .db import Database
 from .entities import (
     Entity, has_custom_emoji, mask_custom_emoji, remap_custom_emoji, restore_custom_emoji, strip_links,
 )
-from .feeds import MESSAGE_LIMIT, FetchedPost, Reader, compose_post, source_label
+from .feeds import MESSAGE_LIMIT, FetchedPost, Reader, compose_post, drop_last_visual, source_label
 from .mirror_engine import Rewriter, _safe_dm, _should_notify, default_rewriter, rewrite_with_quota
 from .publisher import copy_staged, publish_fetched, recent_sends
 
@@ -38,7 +38,8 @@ async def deliver(
     (эмодзи при этом пропадают, зато пост выходит). Иначе публикует бот.
     """
     via = (cfg.feed_publish_via if cfg is not None else "auto")
-    big = any(getattr(m, "big", False) for m in post.media)  # файлы больше 20 МБ боту не по силам
+    # файлы больше 20 МБ боту не по силам (в том числе уже со знаком, скачанные аккаунтом)
+    big = any(getattr(m, "big", False) or getattr(m, "force_account", False) for m in post.media)
     emoji = has_custom_emoji(entities)
     if hasattr(reader, "send") and (
         big or (via == "auto" and emoji and getattr(reader, "premium", False))
@@ -158,6 +159,9 @@ async def process_feed(
 
     log.info("Источник %s: новых постов %d (после id %d)", label, len(posts), feed["last_msg_id"])
     prefs = await db.get_feed_prefs(owner)
+    copy_mode = feed.get("kind") == "copy"  # админское копирование: текст как есть, без ИИ, подписи и чистки ссылок
+    if copy_mode:
+        prefs = {**prefs, "strip_links": False, "footer": "", "footer_entities": []}
     footer_entities = [Entity(**d) for d in prefs["footer_entities"]]
     wm = await db.get_watermark(owner)
     wm_on = wm["feeds"] and watermark.ready(wm)
@@ -166,7 +170,7 @@ async def process_feed(
         text, entities = post.text, post.entities
         if prefs["strip_links"]:
             text, entities = strip_links(text, entities)  # чужие ссылки и @упоминания до ИИ
-        if feed["rewrite"] and text.strip():
+        if feed["rewrite"] and not copy_mode and text.strip():
             log.info("Источник %s: ИИ переписывает пост %s (модель отвечает долго, это нормально)...", label,
                      post.message_ids)
             started = time.monotonic()
@@ -194,9 +198,15 @@ async def process_feed(
                                              title=feed["title"], footer=prefs["footer"],
                                              footer_entities=footer_entities)
 
+        if copy_mode and len(post.media) > 1:
+            trimmed = drop_last_visual(post.media)
+            if len(trimmed) != len(post.media):
+                log.info("Источник %s: в посте %s несколько фото/видео, последнее отброшено", label,
+                         post.message_ids)
+                post = replace(post, media=trimmed)
         if wm_on and any(m.kind in ("photo", "video") for m in post.media):
             try:
-                post = replace(post, media=await watermark.apply_items(post.media, wm))
+                post = replace(post, media=await watermark.apply_items(post.media, wm, getattr(reader, "download_item", None)))
             except Exception as exc:  # noqa: BLE001 — пост без знака не публикуем
                 log.warning("Источник %s: водяной знак на посте %s не нанесён: %s", label, post.message_ids, exc)
                 if _should_notify("wm", feed["id"], time.time()):

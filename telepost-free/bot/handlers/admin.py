@@ -72,6 +72,7 @@ def home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="ad:list:0"),
          InlineKeyboardButton(text="🔎 Найти", callback_data="ad:find")],
+        [InlineKeyboardButton(text="📋 Копирование", callback_data="cp:home")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="ad:home")],
     ])
 
