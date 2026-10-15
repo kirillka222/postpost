@@ -10,7 +10,9 @@ from aiogram.types import BotCommand
 from .config import load_config
 from .db import Database
 from .feed_engine import feed_loop
-from .handlers import admin, billing, channels, common, copyfeeds, discussion, fallback, feeds, posting, watermark
+from .handlers import (
+    admin, billing, channels, common, copyfeeds, discussion, fallback, feeds, posting, watermark_settings,
+)
 from .middleware import activity_middleware
 from .scheduler import scheduler_loop
 
@@ -83,7 +85,7 @@ async def main() -> None:
     # порядок важен: posting ловит «любое сообщение» и должен идти последним
     dp.message.outer_middleware(activity_middleware)
     dp.callback_query.outer_middleware(activity_middleware)
-    dp.include_routers(discussion.router, admin.router, common.router, channels.router, feeds.router, copyfeeds.router, billing.router, watermark.router, posting.router, fallback.router)
+    dp.include_routers(discussion.router, admin.router, common.router, channels.router, feeds.router, copyfeeds.router, billing.router, watermark_settings.router, posting.router, fallback.router)
 
     scheduler = asyncio.create_task(scheduler_loop(bot, db, reader))
     feed_task = asyncio.create_task(feed_loop(bot, db, cfg, reader)) if reader else None
