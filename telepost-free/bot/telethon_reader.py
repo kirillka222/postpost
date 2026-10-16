@@ -327,6 +327,70 @@ class TelethonReader:
             raise SourceError("файл не скачался")
         return bytes(data)
 
+    # ---------- чистка аудитории канала ----------
+    async def can_ban(self, chat_id: int) -> bool:
+        """У аккаунта есть право «Блокировка пользователей» в канале."""
+        try:
+            perms = await self.client.get_permissions(await self._peer(chat_id), "me")
+        except Exception:  # noqa: BLE001
+            return False
+        if getattr(perms, "is_creator", False):
+            return True
+        return bool(getattr(perms, "is_admin", False) and getattr(perms, "ban_users", False))
+
+    def _subscriber(self, u: Any) -> Any:
+        from .audit import Subscriber
+
+        first = getattr(u, "first_name", "") or ""
+        last = getattr(u, "last_name", "") or ""
+        part = type(getattr(u, "participant", None)).__name__
+        return Subscriber(
+            id=int(u.id), name=f"{first} {last}".strip(), username=getattr(u, "username", "") or "",
+            deleted=bool(getattr(u, "deleted", False)), bot=bool(getattr(u, "bot", False)),
+            fake=bool(getattr(u, "fake", False) or getattr(u, "scam", False)),
+            is_admin=part in ("ChannelParticipantAdmin", "ChannelParticipantCreator") or int(u.id) == self.me_id,
+            lang=str(getattr(u, "lang_code", "") or ""), raw=u,
+        )
+
+    SEARCH_ALPHABET = (
+        "abcdefghijklmnopqrstuvwxyz0123456789"
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґў"
+        "ابتثجحخدذرزسشصضطظعغفقكلمنهوي"
+    )
+
+    async def list_subscribers(self, chat_id: int, progress: Optional[Callable[[int], Any]] = None) -> tuple[list[Any], int]:
+        """Подписчики канала и их общее число по данным Telegram. Telegram отдаёт список порциями и обрывает его
+        примерно на 10 000, поэтому если собрано меньше, чем всего, добираем поиском по буквам."""
+        peer = await self._peer(chat_id)
+        found: dict[int, Any] = {}
+
+        async def collect(**kw: Any) -> None:
+            async for u in self.client.iter_participants(peer, limit=None, **kw):
+                if int(u.id) not in found:
+                    found[int(u.id)] = self._subscriber(u)
+                    if progress is not None and len(found) % 500 == 0:
+                        await progress(len(found))
+
+        total = 0
+        try:
+            head = await self.client.get_participants(peer, limit=0)
+            total = int(getattr(head, "total", 0) or 0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось узнать число подписчиков: %s", exc)
+        await collect()
+        if total and len(found) < total:
+            for ch in self.SEARCH_ALPHABET:
+                if len(found) >= total:
+                    break
+                await collect(search=ch)
+        return list(found.values()), total or len(found)
+
+    async def ban(self, chat_id: int, sub: Any) -> None:
+        """Блокирует подписчика в канале (он удаляется из подписчиков и не сможет вернуться по ссылке)."""
+        peer = await self._peer(chat_id)
+        user = sub.raw if getattr(sub, "raw", None) is not None else sub.id
+        await self.client.edit_permissions(peer, user, view_messages=False)
+
     async def delete(self, chat_id: int, message_ids: list[int]) -> None:
         """Удаляет сообщения аккаунта (чистка служебного канала после копирования)."""
         await self.client.delete_messages(await self._peer(chat_id), message_ids)

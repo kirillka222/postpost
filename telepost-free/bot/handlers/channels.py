@@ -211,6 +211,7 @@ async def cb_channel_card(cb: CallbackQuery, db: Database, reader: Optional[Any]
     handle = f" (@{channel['username']})" if channel["username"] else ""
     rows = []
     rows += [
+        [InlineKeyboardButton(text="🧹 Чистка от ботов и бурж-аудитории", callback_data=f"au:{chat_id}")],
         [InlineKeyboardButton(text="🗑 Отключить канал", callback_data=f"chdel:{chat_id}")],
         [InlineKeyboardButton(text="◀️ К списку каналов", callback_data="chlist")],
     ]
